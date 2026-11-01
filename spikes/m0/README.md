@@ -88,6 +88,36 @@ replays two of your real sessions for before/after comparisons.
 Writer model comparison (same conversations, same judge): gpt-oss medium 7.0 overall / 3.8 faithful,
 gpt-oss high 8.1 / 5.8, GLM-5.3 8.9 / 9.5 (11.5 s), DeepSeek-V4.1-Flash 8.9 / 9.5 (4 s, shortest drafts).
 
+## Session awareness (/btw)
+
+Passe sees your coding-agent session: by default the most recently active Claude Code session
+(`--session latest|<id prefix>|<title word>|none`). `agent_sessions.py` lists sessions (herdr pane titles where
+available; `uv run agent_sessions.py`), reads Claude Code transcripts and has a background model brief them
+(summary, key points, results, open problems, next steps; cached until the session moves on).
+
+| Say | What happens |
+|---|---|
+| "let's draft a prompt" | `session_brief` → Passe says where the session stands and suggests the next step → drafting starts |
+| "what did it just do?", "why did it pick that?" | `ask_session`, answered from the transcript |
+| "which sessions are there?" / "use the trading one" | `list_sessions` / `use_session` |
+
+The writer grounds drafts in the brief, and every draft opens with a **Read first** line pointing the agent at
+this Passe conversation's log. Ideas are grounded: Passe checks what the session already has before suggesting
+anything, one suggestion at a time. Replay: `uv run sim.py fromsession`, which scored prompt 9.2 ·
+conversation 10 · tools 9.5 on 2026-11-01.
+
+### Honest drafting
+
+The writer takes several seconds (6–27 s in practice), so after `update_draft` Passe says it's *updating*, never
+that it's done. When a draft you asked for lands, it says "Draft's updated." at the next quiet moment, or not at
+all if you're already talking. The scorecard flags "said the draft was updated before it was".
+
+### Screen recording
+
+"Record my screen" / "stop recording": the full screen plus **desktop audio** (Passe's voice, anything playing),
+no microphone: what you say is already in the transcript and the event log. Saved to `~/Videos`; ● REC shows
+in the header, and it stops cleanly if Passe exits.
+
 ## Observability
 
 Every run writes an event log to `~/.local/state/passe/spike-<time>.jsonl` (`--no-log` to disable): speech
@@ -142,7 +172,7 @@ paragraphs for long ones). `uv run consistency_eval.py` measures it, here with 3
 | per sentence, lower temperature | 0.566 | 28.6 Hz | 3.1 dB |
 | **whole reply (now)** | **0.600** | **18.3 Hz** | **1.9 dB** |
 
-Cost: Passe waits for the LLM to finish the reply before speaking, about +250–350 ms per turn in the scripted
+Orpheus gets an audio-token budget proportional to the text (a fixed 1600 cut long replies off at 19.5 s), and the server runs with an 8k context. Cost: Passe waits for the LLM to finish the reply before speaking, about +250–350 ms per turn in the scripted
 runs. `--tts-chunk sentence` switches back.
 
 ## Voice library

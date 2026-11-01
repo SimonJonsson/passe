@@ -49,6 +49,10 @@ Rules:
 - Sections, in this order, omitting empty ones: Goal, Context, Requirements, Out of scope, Done when,
   Open questions. Markdown is fine. Concise: no filler, no restating the same point.
 - "Done when" must be checkable and proportionate: what a person or test would verify, nothing grander.
+- If a coding-agent session brief is given, ground the prompt in it: where the session stands, its results and
+  the next step the user chose. Facts from the brief count as stated.
+- If a Passe log path is given, start the draft with a "Read first" line telling the agent to read that file
+  (the JSONL log of this Passe conversation) for the full discussion behind the prompt.
 
 Reply with JSON only: {{"draft": "<full markdown draft>", "changed": "<one short sentence: what changed>",
 "open_questions": ["<question>", …]}}"""
@@ -89,24 +93,30 @@ def _json_call(system: str, user: str, cfg: dict, max_tokens: int = 6000) -> dic
 
 CONVO_RUBRIC = {
     "one_question": "Each reply asks at most one question.",
-    "diagnostic": "Questions dig into the problem (an example, where it happens, how to verify), never menus of "
-                  "options ('friendly, calm or upbeat?').",
+    "questions": "Asks only when it can't take the next step itself; when it does ask, the question is about the "
+                 "problem (an example, where, how to verify), never a menu of preferences. No question at all is fine "
+                 "when acting was the right move.",
     "concise": "Replies are short enough to listen to (about two sentences) unless the user asked for more.",
     "responsive": "Each reply addresses what the user just said; corrections are acknowledged and taken on board.",
-    "no_invention": "Passe doesn't push requirements, features or tools the user never raised.",
+    "grounded": "Ideas come from what the user said or what the coding-agent session already has, offered one at a "
+                "time as suggestions. Generic pitches (dashboards, tracing, metrics) nobody pointed to cost points.",
     "flow": "Natural spoken conversation: no repetition, no reading the draft or lists aloud, no needless "
             "wrapping up.",
+    "acts_on_requests": "When the user asks for something (draft a prompt, explain, copy), PASSE does it or takes "
+                        "the obvious first step, instead of deflecting into questions about what they want.",
 }
 
 CONVO_SYSTEM = f"""You review a spoken conversation in which a voice assistant (PASSE) helps a USER shape a prompt
-for a coding agent. Speech recognition errors in USER lines are not PASSE's fault. Score each criterion 0-10, strictly:
+for a coding agent. Speech recognition errors in USER lines are not PASSE's fault. PASSE writes the draft into a
+panel on screen instead of speaking it: lines like "[draft v2 written]" mark that. If a coding-agent session brief
+is given, PASSE can see that session, so facts from it are legitimate, not invented. Score each criterion 0-10, strictly:
 {json.dumps(CONVO_RUBRIC, indent=1)}
 Reply with JSON only: {{"scores": {{"<criterion>": <0-10>, …}}, "issues": ["<short concrete example of a problem,
 quoting PASSE>", …]}}"""
 
 
-def judge_conversation(conversation: str) -> dict:
-    out = _json_call(CONVO_SYSTEM, conversation, JUDGE)
+def judge_conversation(conversation: str, context: str = "") -> dict:
+    out = _json_call(CONVO_SYSTEM, (f"{context}\n\n" if context else "") + conversation, JUDGE)
     scores = {k: float(out.get("scores", {}).get(k, 0)) for k in CONVO_RUBRIC}
     return {"scores": scores, "overall": round(sum(scores.values()) / len(scores), 1), "issues": out.get("issues") or []}
 
@@ -122,16 +132,18 @@ def conversation_text(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def write_draft(conversation: str, current: str, note: str = "") -> dict:
-    user = (f"Conversation so far:\n{conversation}\n\nCurrent draft:\n{current or '(none yet)'}"
+def write_draft(conversation: str, current: str, note: str = "", context: str = "") -> dict:
+    user = ((f"{context}\n\n" if context else "")
+            + f"Conversation so far:\n{conversation}\n\nCurrent draft:\n{current or '(none yet)'}"
             + (f"\n\nWhat Passe noted as the latest change: {note}" if note else ""))
     out = _json_call(DRAFT_SYSTEM, user, DRAFTER)
     return {"draft": (out.get("draft") or current or "").strip(), "changed": out.get("changed", ""),
             "open_questions": out.get("open_questions") or []}
 
 
-def judge(conversation: str, draft: str, quick: bool = False) -> dict:
-    out = _json_call(JUDGE_SYSTEM, f"Conversation:\n{conversation}\n\nFinal draft:\n{draft}",
+def judge(conversation: str, draft: str, quick: bool = False, context: str = "") -> dict:
+    out = _json_call(JUDGE_SYSTEM, (f"{context}\n(Facts from this context count as stated, not invented.)\n\n"
+                                    if context else "") + f"Conversation:\n{conversation}\n\nFinal draft:\n{draft}",
                      QUICK_JUDGE if quick else JUDGE)
     scores = {k: float(out.get("scores", {}).get(k, 0)) for k in RUBRIC}
     return {"scores": scores, "overall": round(sum(scores.values()) / len(scores), 1),

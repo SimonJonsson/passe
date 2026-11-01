@@ -41,17 +41,31 @@ running locally on the user's machine. You help a software developer think thing
 their coding agent, and handle small tasks. You're a capable friend at their elbow, not a formal assistant.
 
 What you're for:
-- Your main job is conversational prompt crafting. The user talks through what they want their coding agent
-  (Claude Code, Codex and the like) to do, and together you shape it into a strong written prompt.
-- Understand before you shape: find out, one short question at a time, what the problem or goal is in concrete
-  terms (ask for an example or what they saw), where it happens, and how they'll know it's done. Ask diagnostic
-  questions, not menus of preferences ("Friendly, calm or upbeat?" is a bad question). Exactly one question
-  per reply, about one thing: never two asks joined with "and", never a list of options. Two or three questions in total is plenty.
-- Never suggest requirements, tools, numbers or features the user hasn't brought up. Unknowns are fine: they
-  end up as open questions in the draft.
+- You're a capable assistant: when the user asks for something, do it. Don't turn requests into questions about
+  what they're trying to solve. Ask only when you genuinely can't take the next step, one question about one
+  thing, never a menu of options.
+- You can see the user's coding-agent session (Claude Code) through tools: session_brief (summary, key points,
+  results, next steps), ask_session (answers any question from its transcript), list_sessions and use_session
+  (switch to another one). That's your context: lean on it instead of asking the user to explain.
+- Drafting a prompt ("let's draft a prompt", "what should we tell it next?"): call session_brief, then say the
+  actual content in a couple of spoken sentences: where the session stands, the one or two results that matter,
+  and the next step you'd suggest ("It just tightened turn-taking and the copy check works. Next I'd have it…").
+  Never describe what you're about to do instead of doing it. In the same reply call update_draft with that
+  concrete next step as the note. Then refine together; the user steers. You draft prompts; the coding agent
+  does the work, so say "we'll have it…", never "I'll fix…".
+- "By the way" questions about the session ("what did it just do?", "why did it pick that?", "explain that
+  bit"): call ask_session and pass the answer on in your own words.
+- Ideas are welcome, but grounded: before suggesting anything, check what the session already has
+  (session_brief or ask_session) and build on that ("We already log every turn; what's missing is a quick way to
+  flag a problem."). Offer one idea at a time, clearly as a suggestion, and let the user decide. Never pitch
+  generic solutions (dashboards, tracing, metrics) the session and the user haven't pointed to.
+- Don't put requirements in the draft that neither the user nor the session brought up. Unknowns are fine:
+  they end up as open questions.
 - You don't write the draft yourself: a writer does, in the background, from the whole conversation. Call
   update_draft once, with a one-sentence note, as soon as there's a useful idea; after that the draft follows
   the conversation automatically. Call it again only to point out something specific.
+- The writer takes several seconds. After update_draft, say you're updating it ("Updating it now."), never that
+  it's done or added. A short "Draft's updated." is played for you when it lands.
 - When the user corrects you, acknowledge it plainly and call update_draft with the correction.
 - You're told about each new draft version (and its open questions) in a note at the start of the next turn.
   Never read the draft aloud unless asked; when asked to summarise, do it conversationally in a few sentences.
@@ -235,6 +249,10 @@ class Stats:
     drafting: bool = False  # the background writer is working
     draft_note_pending: str | None = None  # told to the talker at the start of the next user turn
     last_check: dict | None = None
+    recording_since: float | None = None
+    recording_file: str | None = None
+    agent_session: dict | None = None  # the coding-agent session Passe can see
+    agent_brief: dict | None = None
     copy_held_back: bool = False
     last_user_text: str = ""
     session_n: int = 1
@@ -289,6 +307,8 @@ def parse_args() -> argparse.Namespace:
                    help="delivery style: persona manner + (Orpheus) warm, soft post-processing")
     p.add_argument("--pitch", type=float, default=0.0,
                    help="with --audition: pitch shift in semitones (e.g. -1.5); not live yet (adds ~1 s delay)")
+    p.add_argument("--session", default="latest",
+                   help="coding-agent session Passe can see: latest, a session id (prefix), a title word, or none")
     p.add_argument("--drafter-model", default=None,
                    help="model that writes the draft (default: DeepSeek-V4.1-Flash, see prompt_quality.DRAFTER)")
     p.add_argument("--copy-bar", type=float, default=7.0,
@@ -445,7 +465,10 @@ def render(stats: Stats, args: argparse.Namespace):
         f"{(' · chunk ' + args.tts_chunk) if args.tts == 'orpheus' else f' {args.speed:g}x'}"
         f" · up {up:,.0f}s",
         "\n",
-        (f"   session {stats.session_n}", "bold"),
+        (f"   ● REC {time.monotonic() - stats.recording_since:,.0f}s · " if stats.recording_since else "   ",
+         "bold red"),
+        (f"session {stats.session_n}", "bold"),
+        (f" · agent: {stats.agent_session['title'][:40]}" if stats.agent_session else " · agent: none", "cyan"),
         f" · {(time.monotonic() - stats.session_start) / 60:.0f} min · draft v{len(stats.draft_versions)}"
         + (f" · ignored {stats.ignored_while_idle} while idle" if stats.ignored_while_idle else "")
         + (f" · ignored {stats.ignored_while_paused} while paused" if stats.ignored_while_paused else ""),
@@ -560,17 +583,27 @@ def render(stats: Stats, args: argparse.Namespace):
             tl.append(f"{c['result']}\n")
     v = len(stats.draft_versions)
     copied = v and stats.draft_copied == v
+    term = shutil.get_terminal_size((120, 40))
+    prompt_h = max(14, term.lines - CONVO_HEIGHT - 30)  # whatever the other panels leave over
     draft = Text(stats.draft_versions[-1] if v else "(no draft yet: talk through what you want your agent to do)",
                  style="" if v else "dim")
+    if v:
+        pw = max(20, int((term.columns - 6) * 3 / 4) - 4)
+        lines = list(draft.wrap(_Console(width=pw + 4), pw))
+        if len(lines) > prompt_h - 2:
+            hidden = len(lines) - (prompt_h - 3)
+            draft = Text("\n").join(lines[: prompt_h - 3])
+            draft.append(f"\n… {hidden} more lines · full prompt on the clipboard after 'copy it', and in the log",
+                         style="dim")
     tools_row = Table.grid(expand=True, padding=(0, 1))
     tools_row.add_column(ratio=1)
-    tools_row.add_column(ratio=2)
+    tools_row.add_column(ratio=3)
     tools_row.add_row(
-        Panel(tl or Text("(no tool calls yet)", style="dim"), title="tools", border_style="dim", height=14),
+        Panel(tl or Text("(no tool calls yet)", style="dim"), title="tools", border_style="dim", height=prompt_h),
         Panel(draft, title=f"prompt · v{v}" + (" · writing…" if stats.drafting else "")
               + (f" · check {stats.last_check['overall']}/10" if stats.last_check else "")
               + (" · copied to clipboard ✓" if copied else ""),
-              border_style="green" if copied else ("cyan" if v else "dim"), height=14),
+              border_style="green" if copied else ("cyan" if v else "dim"), height=prompt_h),
     )
 
     parts = [
@@ -725,7 +758,7 @@ def make_tts(args: argparse.Namespace, voice_name: str, stats: Stats):
         if args.tts_chunk == "paragraph":  # one generation per reply/paragraph keeps the delivery consistent
             from orpheus_tts import paragraph_aggregator
 
-            tts._text_aggregator = paragraph_aggregator(max_chars=400)
+            tts._text_aggregator = paragraph_aggregator(max_chars=300)
         stats.tts_cps = 14.0  # refined from real audio as it speaks
         return tts
     if args.tts == "pocket":
@@ -789,14 +822,41 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
     catalog = voice_catalog(args)
     preview_cursor = {"i": 0}
     lead_ins = {"set_voice": "Okay.", "preview_voices": "Sure, here are a few.",
-                "copy_to_clipboard": "Giving it a quick look first."}
-    writer: dict = {"task": None, "pending": None}
+                "copy_to_clipboard": "Giving it a quick look first.",
+                "session_brief": "Let me look at where the session's at.", "ask_session": "Let me check.",
+                "start_screen_recording": "Starting the recording.",
+                "stop_screen_recording": "Stopping it and saving."}
+    writer: dict = {"task": None, "pending": None, "announce": False}
+
+    def context_for_writer() -> str:
+        import agent_sessions
+
+        parts = []
+        if stats.agent_brief:
+            parts.append("Coding-agent session brief:\n" + agent_sessions.brief_text(stats.agent_brief))
+        if _LOG is not None:
+            parts.append(f"Passe log path: {_LOG.path}")
+        return "\n\n".join(parts)
+
+    holder["writer_context"] = context_for_writer
 
     def conversation() -> str:
         import prompt_quality as pq
 
         ctx = holder.get("context")
         return pq.conversation_text(ctx.get_messages()) if ctx else ""
+
+    async def announce_when_quiet(version: int):
+        """Say "Draft's updated." at the next quiet moment (nobody talking), if it's still the newest version."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 20:
+            await asyncio.sleep(0.3)
+            if len(stats.draft_versions) != version or stats.state == "you":
+                return  # superseded, or the user is talking: they'll hear about it in the next reply
+            if stats.state == "listening" and not stats._bot_speaking:
+                await llm.push_frame(TTSSpeakFrame("Draft's updated."))
+                ev("tts_speak", text="Draft's updated.", reason="draft landed")
+                return
 
     async def run_writer(note: str):
         """Background drafter; requests that arrive while it works are merged into one more pass."""
@@ -807,7 +867,7 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
             stats.drafting = True
             t0 = time.monotonic()
             try:
-                out = await asyncio.to_thread(pq.write_draft, conversation(), current, note)
+                out = await asyncio.to_thread(pq.write_draft, conversation(), current, note, context_for_writer())
             except Exception as e:  # keep talking even if the writer fails
                 ev("error", error=f"draft writer: {e}")
                 out = {"draft": current, "changed": "", "open_questions": []}
@@ -819,15 +879,24 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                 ev("draft", version=v, text=out["draft"], changed=out["changed"],
                    open_questions=out["open_questions"], secs=round(time.monotonic() - t0, 2))
                 qs = "; ".join(out["open_questions"]) or "none"
+                if writer.pop("announce", False):
+                    if writer.get("announcer") and not writer["announcer"].done():
+                        writer["announcer"].cancel()  # one announcement, for the newest draft
+                    writer["announcer"] = asyncio.create_task(announce_when_quiet(v))
                 stats.draft_note_pending = (f"[Draft v{v} is ready (for reference; never read it aloud). Changed: "
                                             f"{out['changed']} Open questions: {qs}\n---\n{out['draft']}\n---]")
             note, writer["pending"] = writer["pending"], None
+
+    turn_calls: dict = {}  # (user turn text, tool) → calls; breaks retry loops within one turn
 
     def track(params) -> dict:
         call = {"name": params.function_name, "args": dict(params.arguments or {}), "start": time.monotonic(),
                 "end": None, "result": None}
         stats.tool_calls.append(call)
         ev("tool_call", name=call["name"], args={k: v for k, v in call["args"].items()})
+        key = (stats.last_user_text, call["name"])
+        turn_calls[key] = turn_calls.get(key, 0) + 1
+        call["repeat"] = turn_calls[key]
         return call
 
     async def done(params, call: dict, result: dict, summary: str):
@@ -870,10 +939,17 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         if CONTROL_UTTERANCE.search(stats.last_user_text or ""):
             ev("guard_blocked", tool="update_draft", reason="the user gave Passe an instruction, not task content",
                last_user=stats.last_user_text)
-            await done(params, call, {"ignored": "that was an instruction to you, not part of the task"}, "ignored")
+            await done(params, call, {"ignored": "that was an instruction to you, not part of the task",
+                                      "next": "don't call this again now; just reply to the user"}, "ignored")
             return
+        writer["announce"] = True  # the user asked for this one: say so when it lands
         request_draft(str(params.arguments.get("note", "")).strip())
-        await done(params, call, {"status": "the writer is updating the draft in the background"},
+        briefed = (stats.last_user_text, "session_brief") in turn_calls
+        say = ("in two or three spoken sentences: where the session stands, the one or two results that matter, and "
+               "the next step you suggest (from the brief); then that you're putting it in the draft"
+               if briefed else "your reply to the user, plus that you're updating the draft")
+        await done(params, call, {"status": "started, NOT done yet: the writer takes several seconds",
+                                  "say": say + ". Never say the draft is done or already updated."},
                    f"writing v{len(stats.draft_versions) + 1}…")
 
     async def revert_draft(params):
@@ -889,10 +965,16 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
 
     async def copy_to_clipboard(params):
         call = track(params)
+        if call["repeat"] > 2:
+            ev("guard_blocked", tool="copy_to_clipboard", reason="repeated within one turn",
+               last_user=stats.last_user_text)
+            await done(params, call, {"error": "already handled this turn. Stop calling tools and reply."}, "loop cut")
+            return
         if not COPY_REQUEST.search(stats.last_user_text or ""):
             ev("guard_blocked", tool="copy_to_clipboard", reason="the user didn't ask to copy",
                last_user=stats.last_user_text)
-            await done(params, call, {"copied": False, "note": "the user didn't ask to copy; don't, unless they do"},
+            await done(params, call, {"copied": False, "note": "the user didn't ask to copy. Don't call "
+                                      "copy_to_clipboard again until they do; just reply to what they said."},
                        "not asked to copy")
             return
         if writer["task"] is not None and not writer["task"].done():
@@ -907,7 +989,8 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         if stats.draft_versions and not force:
             import prompt_quality as pq
 
-            check = await asyncio.to_thread(pq.judge, conversation(), stats.draft_versions[-1], True)
+            check = await asyncio.to_thread(pq.judge, conversation(), stats.draft_versions[-1], True,
+                                            context_for_writer())
             stats.last_check = check
             ev("draft_check", version=len(stats.draft_versions), overall=check["overall"], scores=check["scores"],
                invented=check["invented"], stale=check["stale"], gaps=check["gaps"])
@@ -920,7 +1003,8 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                     await asyncio.wait_for(asyncio.shield(writer["task"]), timeout=30)
                 except asyncio.TimeoutError:
                     pass
-                check = await asyncio.to_thread(pq.judge, conversation(), stats.draft_versions[-1], True)
+                check = await asyncio.to_thread(pq.judge, conversation(), stats.draft_versions[-1], True,
+                                                context_for_writer())
                 stats.last_check = check
                 ev("draft_check", version=len(stats.draft_versions), overall=check["overall"],
                    scores=check["scores"], invented=check["invented"], stale=check["stale"], gaps=check["gaps"],
@@ -947,6 +1031,110 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
             stats.copy_held_back = False
         await done(params, call, {"ok": ok, "version": len(stats.draft_versions), "characters": len(text)},
                    f"copied v{len(stats.draft_versions)} ({len(text)} chars)" if ok else "wl-copy failed")
+
+    async def ensure_brief() -> dict | None:
+        import agent_sessions
+
+        if stats.agent_session is None:
+            return None
+        stats.agent_brief = await asyncio.to_thread(agent_sessions.brief, stats.agent_session)
+        ev("agent_brief", session=stats.agent_session["id"], title=stats.agent_session["title"],
+           brief=agent_sessions.brief_text(stats.agent_brief))
+        return stats.agent_brief
+
+    holder["ensure_brief"] = ensure_brief
+
+    async def session_brief(params):
+        call = track(params)
+        if stats.agent_session is None:
+            await done(params, call, {"error": "no coding-agent session attached; offer list_sessions"}, "no session")
+            return
+        b = await ensure_brief()
+        await done(params, call, {"session": stats.agent_session["title"], **(b or {})},
+                   f"brief: {stats.agent_session['title']}")
+
+    async def ask_session(params):
+        call = track(params)
+        import agent_sessions
+
+        if stats.agent_session is None:
+            await done(params, call, {"error": "no coding-agent session attached"}, "no session")
+            return
+        q = str(params.arguments.get("question", ""))
+        answer = await asyncio.to_thread(agent_sessions.ask, stats.agent_session, q)
+        await done(params, call, {"answer": answer}, f"answered: {q[:40]}")
+
+    async def list_sessions(params):
+        call = track(params)
+        import agent_sessions
+
+        found = await asyncio.to_thread(agent_sessions.list_sessions)
+        stats.session_choices = found
+        rows = [{"number": i, "title": s["title"], "minutes_since_active": s["age_min"],
+                 "current": bool(stats.agent_session and s["id"] == stats.agent_session["id"])}
+                for i, s in enumerate(found, 1)]
+        await done(params, call, {"sessions": rows}, f"{len(rows)} sessions")
+
+    async def use_session(params):
+        call = track(params)
+        import agent_sessions
+
+        n, name = params.arguments.get("number"), str(params.arguments.get("name") or "")
+        choices = getattr(stats, "session_choices", None) or await asyncio.to_thread(agent_sessions.list_sessions)
+        pick = choices[int(n) - 1] if n and 1 <= int(n) <= len(choices) else (
+            agent_sessions.find_session(name) if name else None)
+        if pick is None:
+            await done(params, call, {"error": "no such session"}, "not found")
+            return
+        stats.agent_session, stats.agent_brief = pick, None
+        ev("agent_session", id=pick["id"], title=pick["title"])
+        await ensure_brief()
+        await done(params, call, {"now_using": pick["title"], "summary": (stats.agent_brief or {}).get("summary")},
+                   f"using {pick['title']}")
+
+    async def recording_active() -> bool:
+        proc = await asyncio.create_subprocess_exec("pgrep", "-f", "^gpu-screen-recorder",
+                                                    stdout=asyncio.subprocess.DEVNULL)
+        return await proc.wait() == 0
+
+    async def start_screen_recording(params):
+        """Full screen + desktop audio (Passe's voice, anything playing). No microphone: what the user says is
+        already in the transcript and the event log."""
+        call = track(params)
+        if await recording_active():
+            await done(params, call, {"ok": False, "error": "a recording is already running"}, "already recording")
+            return
+        cmd = ["omarchy", "capture", "screenrecording", "--fullscreen", "--with-desktop-audio"]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL,
+                                                    stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        await proc.wait()
+        if await recording_active():
+            stats.recording_since = time.monotonic()
+            name_file = Path("/tmp/omarchy-screenrecord-filename")
+            stats.recording_file = name_file.read_text().strip() if name_file.exists() else None
+            await done(params, call, {"ok": True, "recording": "full screen with desktop audio, no microphone"},
+                       "recording (screen + desktop audio)")
+        else:
+            await done(params, call, {"ok": False, "error": "recorder did not start"}, "failed to start")
+
+    async def stop_screen_recording(params):
+        call = track(params)
+        if not await recording_active():
+            await done(params, call, {"ok": False, "error": "no recording is running"}, "nothing to stop")
+            return
+        proc = await asyncio.create_subprocess_exec("omarchy", "capture", "screenrecording", "--stop-recording",
+                                                    stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        out, _ = await proc.communicate()
+        secs = time.monotonic() - stats.recording_since if stats.recording_since else None
+        stats.recording_since = None
+        path = (out.decode().strip().splitlines() or [stats.recording_file or ""])[-1]
+        size = Path(path).stat().st_size / 2**20 if path and Path(path).exists() else None
+        ev("recording_saved", file=path, secs=round(secs) if secs else None)
+        await done(params, call, {"ok": True, "file": Path(path).name if path else None,
+                                  "duration_secs": round(secs) if secs else None,
+                                  "size_mb": round(size, 1) if size else None},
+                   f"saved {Path(path).name if path else '?'}" + (f" · {size:.1f} MB" if size else ""))
 
     async def preview_voices(params):
         """Each voice introduces itself, numbered; then the current voice is restored."""
@@ -977,6 +1165,16 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                        {"version": {"type": "integer", "minimum": 1}}, []),
         FunctionSchema("copy_to_clipboard", "Check the draft, then copy it to the clipboard. force skips the check.",
                        {"force": {"type": "boolean"}}, []),
+        FunctionSchema("session_brief", "Summary, key points, results and next steps of the user's coding-agent "
+                       "session.", {}, []),
+        FunctionSchema("ask_session", "Answer a question about the coding-agent session from its transcript.",
+                       {"question": {"type": "string"}}, ["question"]),
+        FunctionSchema("list_sessions", "List the user's recent coding-agent sessions.", {}, []),
+        FunctionSchema("use_session", "Switch to another coding-agent session (number from list_sessions, or a name).",
+                       {"number": {"type": "integer", "minimum": 1}, "name": {"type": "string"}}, []),
+        FunctionSchema("start_screen_recording", "Start recording the full screen with desktop audio (no microphone). "
+                       "Only when the user asks to record.", {}, []),
+        FunctionSchema("stop_screen_recording", "Stop the screen recording and save it to ~/Videos.", {}, []),
         FunctionSchema("set_voice",
                        "Change your speaking voice. Use number to pick from the last preview. Omit both to move to "
                        "the next voice. make_default saves it as the user's main voice for next time.",
@@ -990,7 +1188,10 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                         "count": {"type": "integer", "minimum": 1, "maximum": 8}}, []),
     ]
     for name, handler in (("update_draft", update_draft), ("revert_draft", revert_draft),
-                          ("copy_to_clipboard", copy_to_clipboard)):
+                          ("copy_to_clipboard", copy_to_clipboard), ("session_brief", session_brief),
+                          ("ask_session", ask_session), ("list_sessions", list_sessions),
+                          ("use_session", use_session), ("start_screen_recording", start_screen_recording),
+                          ("stop_screen_recording", stop_screen_recording)):
         llm.register_function(name, handler)
     llm.register_function("set_voice", set_voice)
     llm.register_function("preview_voices", preview_voices)
@@ -1001,7 +1202,8 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         if stats.response_full.strip():
             return
         for fc in function_calls:
-            if fc.function_name == "copy_to_clipboard" and (fc.arguments or {}).get("force"):
+            if fc.function_name == "copy_to_clipboard" and ((fc.arguments or {}).get("force")
+                                                            or not COPY_REQUEST.search(stats.last_user_text or "")):
                 continue
             if fc.function_name in lead_ins:
                 await service.push_frame(TTSSpeakFrame(lead_ins[fc.function_name]))
@@ -1751,11 +1953,20 @@ async def main(args: argparse.Namespace) -> None:
         vad_denoise = DenoiseForVAD()
 
     holder: dict = {}
+    if args.session != "none":
+        import agent_sessions
+
+        stats.agent_session = agent_sessions.find_session(args.session)
+        if stats.agent_session:
+            print(f"Agent session: {stats.agent_session['title']} ({stats.agent_session['id'][:8]})")
+            ev("agent_session", id=stats.agent_session["id"], title=stats.agent_session["title"])
     if args.drafter_model:
         import prompt_quality
 
         prompt_quality.DRAFTER.update({"model": args.drafter_model, "reasoning_effort": None})
     tools = setup_tools(llm, stats, args, holder)
+    if stats.agent_session:  # brief it in the background so the first "let's draft a prompt" is quick
+        asyncio.get_running_loop().create_task(holder["ensure_brief"]())
     voice_line = (f"Right now you're using the voice called {stats.voice}; set_voice can switch to any of: "
                   f"{', '.join(voice_catalog(args))}.")
     prompt = SYSTEM_PROMPT.replace("{VOICE_LINE}", voice_line).replace(
@@ -2121,6 +2332,12 @@ async def main(args: argparse.Namespace) -> None:
                     ui.cancel()
     finally:
         hw.cancel()
+        if stats.recording_since:  # don't leave a recording running after Passe exits
+            import subprocess
+
+            subprocess.run(["omarchy", "capture", "screenrecording", "--stop-recording"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("Stopped the screen recording that was still running (saved to ~/Videos).")
         if args.tts == "orpheus":
             if args.keep_orpheus:
                 print("Orpheus server left running (~11 GB VRAM). Stop it: pkill -f 'vllm serve unsloth/orpheus'")

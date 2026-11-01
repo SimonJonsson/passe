@@ -40,9 +40,12 @@ def sessions(log: Path) -> list[dict]:
         if k in ("session_start", "session_end"):
             if cur["turns"]:
                 out.append(cur)
-            cur = new()
+            ctx, cur = cur.get("context", ""), new()
+            cur["context"] = ctx  # the agent session stays attached across Passe sessions
             continue
         cur["events"].append(e)
+        if k == "agent_brief":
+            cur["context"] = f"Coding-agent session brief:\n{e['brief']}\n\nPasse log path: {log}"
         if k == "user_turn" and e.get("text"):
             cur["turns"].append(("USER", e["text"]))
         elif k == "assistant_turn" and (e.get("full") or "").strip():
@@ -51,6 +54,7 @@ def sessions(log: Path) -> list[dict]:
             cur["draft"] = e["args"]["text"]  # older logs: the talker wrote the draft itself
         elif k == "draft" and e.get("text"):
             cur["draft"] = e["text"]
+            cur["turns"].append(("NOTE", f"[draft v{e.get('version')} written]"))
     if cur["turns"]:
         out.append(cur)
     return out
@@ -73,13 +77,27 @@ def tool_accuracy(s: dict) -> dict:
                    len(evs))
         called = [x for x in evs[i + 1:nxt] if x["kind"] == "tool_call"]
         names = {x["name"] for x in called}
+        # already copied and nothing new drafted since? then not copying again is right
+        last_copy = max((j for j in range(i) if evs[j]["kind"] == "tool_result"
+                         and evs[j].get("name") == "copy_to_clipboard"
+                         and str(evs[j].get("summary", "")).startswith("copied")), default=None)
+        already_copied = last_copy is not None and not any(evs[j]["kind"] == "draft" for j in range(last_copy, i))
         for label, rx, tools in EXPECTED:
             if rx.search(said):
-                if names & tools:
+                if names & tools or (label == "copy request" and already_copied):
                     hits += 1
                 else:
                     misses.append(f"{label} not acted on: {said!r}")
         blocked = {x["tool"] for x in evs[i + 1:nxt] if x["kind"] == "guard_blocked"}
+        # claimed the draft was updated before the writer had produced it
+        claims = [x for x in evs[i + 1:nxt] if x["kind"] == "assistant_turn" and re.search(
+            r"\b(i'?ve|i have|i just)\s+(added|updated|changed|put|included|rewritten)|\bdraft (now|already) "
+            r"(has|includes|covers|mentions)|\b(now|already) (has|includes|mentions) the\b",
+            spike.conversational(x.get("full") or "").replace("’", "'"), re.I)]
+        if "update_draft" in names and claims:
+            landed = next((x["t"] for x in evs[i + 1:] if x["kind"] == "draft"), None)
+            if landed is None or landed > claims[0]["t"]:
+                errors.append(f"said the draft was updated before it was (after: {said!r})")
         if spike.CONTROL_UTTERANCE.search(said) and "update_draft" in names - blocked:
             errors.append(f"drafted from an instruction to Passe: {said!r}")
         if "copy_to_clipboard" in names - blocked and not spike.COPY_REQUEST.search(said):
@@ -101,10 +119,10 @@ def main():
     totals = {"prompt": [], "conversation": [], "tools": []}
     for path in paths:
         for s in sessions(path):
-            convo = "\n".join(f"{who}: {text}" for who, text in s["turns"])
+            convo = "\n".join(text if who == "NOTE" else f"{who}: {text}" for who, text in s["turns"])
             print(f"\n=== {s['log']} · {sum(w == 'USER' for w, _ in s['turns'])} user turns")
             if s["draft"]:
-                votes = [pq.judge(convo, s["draft"]) for _ in range(args.votes)]
+                votes = [pq.judge(convo, s["draft"], context=s.get("context", "")) for _ in range(args.votes)]
                 ps = {k: statistics.mean(v["scores"][k] for v in votes) for k in pq.RUBRIC}
                 p_overall = round(statistics.mean(ps.values()), 1)
                 totals["prompt"].append(p_overall)
@@ -114,7 +132,7 @@ def main():
                         items = sorted({x for v in votes for x in v[label]})
                         if items:
                             print(f"   {label}: " + "; ".join(items[:4]))
-            c = pq.judge_conversation(convo)
+            c = pq.judge_conversation(convo, s.get("context", ""))
             totals["conversation"].append(c["overall"])
             print(f"conversation  {c['overall']:4.1f}/10 · " + " ".join(f"{k} {v:.1f}" for k, v in c["scores"].items()))
             if not args.quiet:

@@ -38,6 +38,13 @@ _SR = 24000
 _FRAME = 2048  # samples per SNAC frame (7 tokens)
 
 
+def audio_token_budget(text: str) -> int:
+    """Enough audio tokens for the text, with room to spare: ~86 tokens per second of speech, and slow, warm
+    delivery runs at ~10 characters a second, so allow ~12 tokens per character (a fixed 1600 cut long replies off
+    at 19.5 s)."""
+    return min(7000, 400 + 12 * len(text))
+
+
 def server_up() -> bool:
     import urllib.request
 
@@ -60,7 +67,7 @@ def launch_server(gpu_fraction: float = 0.3) -> subprocess.Popen | None:
                          "VIRTUAL_ENV=.venv-vllm uv pip install vllm")
     proc = subprocess.Popen(
         [str(vllm), "serve", ORPHEUS_MODEL, "--port", str(PORT), "--gpu-memory-utilization", str(gpu_fraction),
-         "--max-model-len", "2048", "--dtype", "bfloat16"],
+         "--max-model-len", "8192", "--dtype", "bfloat16"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
     )
     # vLLM logs every request. Drain its output continuously, or the pipe fills up and the server blocks.
@@ -168,7 +175,8 @@ class OrpheusTTSService(TTSService):
             voice = self._settings.voice or "tara"
             ids = _START + self._tok.encode(f"{voice}: {text}").ids + _END
             stream = await self._client.completions.create(
-                model=ORPHEUS_MODEL, prompt=ids, max_tokens=1600, stream=True, extra_body=self._extra,
+                model=ORPHEUS_MODEL, prompt=ids, max_tokens=audio_token_budget(text), stream=True,
+                extra_body=self._extra,
                 **self._sampling,
             )
             codes: list[int] = []
