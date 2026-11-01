@@ -15,6 +15,7 @@ access to the session, holds a side conversation about it, and optionally delive
 - Ground that conversation in the agent's own session, for any agent (Claude Code, Codex, aider, …).
 - Also handle OS actions and plain conversation in the same conversation.
 - Multiple entrypoints (Omarchy desktop, terminal, scripts) over one engine.
+- Embeddable in other platforms (e.g. Motherbrain), which bring their own tools and context (§5.4).
 - Run on one local machine with a small budget: local speech models, one cheap hosted LLM call per turn.
 
 **Non-goals (for now)**
@@ -102,7 +103,7 @@ flowchart TB
 
 1. **Clients only speak the protocol.** No client imports `passe-core`. A client can be Python, shell or Lua.
 2. **The core never imports a client** and never assumes a desktop. It receives a `Target`; it doesn't work one out.
-3. **There is always a daemon, the "motherbrain".** Clients start it on demand. It owns everything shared
+3. **There is always a daemon.** Clients start it on demand. It owns everything shared
    (models, audio devices, cost meter, brief cache); each entrypoint runs its own conversations with its own
    profile (§4.2).
 4. **Everything agent-specific is an adapter** (context source, delivery, resolver). Everything
@@ -459,6 +460,44 @@ Mostly configuration and glue, with an idempotent installer and uninstaller.
   indicator**; refreshed by signal (`pkill -RTMIN+N waybar`), not by polling. Clicking brings back the widget.
 - **Notifications** through `notify-send` (mako): "sent to Claude Code in ~/Repos/foo".
 - **Tool pack:** `omarchy` (§4.9).
+
+### 5.4 External platforms (example: Motherbrain)
+
+Passe isn't tied to coding agents. Any platform that would benefit from a spoken side conversation about its
+state can host it. The example is **Motherbrain**, a central intelligence platform for trading projects:
+"what did the momentum strategy do overnight?", "explain this drawdown simply", "draft a research task for
+the backtest agent".
+
+A host platform integrates through the protocol only. Passe never imports it, and it never imports `passe-core`:
+
+```mermaid
+flowchart LR
+    subgraph host["Host platform (e.g. Motherbrain)"]
+        ui["Its UI / service<br/>(protocol client)"]
+        htools["Domain tool pack<br/>positions · PnL · strategy status · run backtest"]
+        hctx["Domain context source<br/>strategy logs · reports · alerts"]
+    end
+    subgraph passe["passed"]
+        conv["Conversation<br/>profile: motherbrain"]
+        gate["Action gate"]
+    end
+    ui <-->|"conversation.*, events"| conv
+    htools -->|"tools.register"| gate
+    hctx -->|"context.register"| conv
+    gate -->|"invoke (callback)"| htools
+```
+
+| Extension point | What the host provides | How |
+|---|---|---|
+| **Profile** | Which packs load, speech style, default mode | Config entry, or `conversation.start{profile}` with inline settings |
+| **Tool pack** | Domain tools with JSON schemas **and safety tiers** | `tools.register`; Passe calls back into the host to run them |
+| **Context source** | Something to brief from and `lookup` into, instead of an agent transcript | `context.register` with `load` / `exchanges` / `search` callbacks |
+| **Delivery** | Where a finalized draft goes (e.g. a task queue for the host's own agents) | A delivery route of kind `callback` |
+
+**Domain safety stays with the host.** Passe's action gate enforces the tier the host declares, but anything
+that moves money or changes live systems should be either **not exposed to Passe at all** or exposed as
+`consequential`, with the host running its own confirmation as well. Passe should be a way to understand
+and to ask, not a hands-free route to placing orders.
 
 ## 6. Conversation state machine
 

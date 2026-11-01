@@ -126,6 +126,7 @@ you've been away from the terminal.
 | **Terminal** | `passe-tui` in a split next to your agent: the same panels as the widget, plus typing. | M3 |
 | **CLI** | `passe start / say / send / cancel / status / bench` for scripts and testing. | M1 |
 | **Protocol** | Versioned JSON-RPC over a Unix socket, so you can write your own client (nvim, a web page, …). | M1 |
+| **External platforms** | Host platforms such as Motherbrain (a central intelligence platform for trading projects) use Passe as their voice layer, bringing their own tools and context. Read-only by default; anything risky is confirmed by the host too. | M5 |
 
 ## 7. Operations
 

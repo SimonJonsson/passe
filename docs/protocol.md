@@ -119,8 +119,22 @@ All events have the form `{"jsonrpc":"2.0","method":"event","params":{"type": ".
 | `spend` | `month_usd, cap_usd` per backend | Status line |
 | `error` | `code, message, recoverable: bool` | Everything |
 
+## Planned: external platforms (M5)
+
+For host platforms such as Motherbrain (see architecture §5.4). The host keeps its connection open and
+answers callbacks from the daemon, so the connection is two-way JSON-RPC.
+
+| Method | Direction | Purpose |
+|---|---|---|
+| `tools.register` | host → daemon | Declare a tool pack: `{pack, tools: [{name, description, schema, tier}]}` |
+| `tools.invoke` | daemon → host | Run a tool after the action gate approves; host returns the result |
+| `context.register` | host → daemon | Declare a context source: `{name, capabilities: ["load","exchanges","search"]}` |
+| `context.load` / `context.exchanges` / `context.search` | daemon → host | Fetch context for briefs, recaps, `lookup` |
+| `delivery.deliver` | daemon → host | Hand over a finalized draft (route kind `callback`) |
+
+Registered packs and sources live only as long as the host's connection.
+
 ## Reserved for later
 
 - `audio.push` / `audio.play`: clients stream mic audio in and playback out, for a remote client with the
   daemon on another machine. Not planned; the method names are reserved so they stay free.
-- `tools.register`: external tool packs declared by schema + command, so packs can be written in any language.

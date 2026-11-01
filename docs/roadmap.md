@@ -76,6 +76,8 @@ pasted into the agent pane.
 
 - [ ] Context sources: `codex`, `aider` (+ `opencode` if used).
 - [ ] tmux/herdr tool pack.
+- [ ] External platform extension points: `tools.register`, `context.register`, callback delivery (architecture §5.4).
+- [ ] First host integration as a proof: a small Motherbrain profile with a read-only tool pack.
 - [ ] Freeze protocol **v1**.
 
 ## Later / maybe
@@ -84,5 +86,5 @@ pasted into the agent pane.
 - Speakers profile (PipeWire echo cancel).
 - Native layer-shell widget (GTK4).
 - Prompt templates and prompt history.
-- `tools.register` for external tool packs; nvim client.
+- nvim client.
 - Parakeet streaming STT as default if it wins the M0 comparison.
