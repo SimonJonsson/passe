@@ -10,9 +10,11 @@ dependencies = [
     "nvidia-curand-cu12>=10.3.10.19",
     "nvidia-ml-py>=13.615.71",
     "onnxruntime-gpu>=1.31.1",
-    "pipecat-ai[kokoro,local,local-smart-turn-v3,openai,silero,whisper]>=1.15.0",
+    "pedalboard>=0.9.26",
+    "pipecat-ai[kokoro,local,local-smart-turn-v3,openai,pocket-tts,silero,whisper]>=1.15.0",
     "psutil>=7.2.2",
     "pyrnnoise>=0.4.5",
     "rich>=15.0.0",
     "sherpa-onnx>=2.0.1",
+    "snac>=1.2.1",
 ]

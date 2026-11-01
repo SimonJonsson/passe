@@ -103,7 +103,10 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--seconds", type=float, default=40)
     p.add_argument("--input-device", type=int, default=None)
+    p.add_argument("--verbose", action="store_true", help="print every configuration's transcript")
     args = p.parse_args()
+
+    raw = asyncio.run(record(args, args.seconds))  # record first, so it's listening immediately
 
     import numpy as np
     import sherpa_onnx
@@ -122,7 +125,6 @@ def main() -> None:
             num_threads=4,
         )
 
-    raw = asyncio.run(record(args, args.seconds))
     fronts = asyncio.run(front_ends(raw))
     ref = words(" ".join(SENTENCES))
 
@@ -154,6 +156,17 @@ def main() -> None:
                 ms = (time.time() - t) * 1000 / max(1, len(segs))
                 rows.append((wer(ref, words(text)), front, seg_name, model_name, ms, text))
 
+    # Audio stats on the raw recording
+    xr = np.frombuffer(raw, np.int16).astype(np.float32)
+    frames = xr[: len(xr) // 512 * 512].reshape(-1, 512)
+    db = 20 * np.log10(np.maximum(np.sqrt((frames**2).mean(1)), 1) / 32768)
+    speech = np.zeros(len(db), bool)
+    for a, b in seg_sets["turns(0.8s)"]:
+        speech[a // 512 : b // 512] = True
+    print(f"\nAudio: speech {np.median(db[speech]) if speech.any() else float('nan'):.0f} dBFS median, "
+          f"peak {db.max():.0f} dBFS, noise {np.median(db[~speech]) if (~speech).any() else float('nan'):.0f} dBFS, "
+          f"clipped samples {(np.abs(xr) >= 32767).mean():.3%}")
+
     rows.sort(key=lambda r: r[0])
     print(f"\n{len(seg_sets['fragments(0.2s)'])} fragments / {len(seg_sets['turns(0.8s)'])} turns detected\n")
     print(f"{'WER':>6}  {'front-end':13} {'segmentation':16} {'model':20} {'ms/seg':>7}")
@@ -163,6 +176,10 @@ def main() -> None:
     print("\nBest:    ", rows[0][5].strip())
     cur = next(r for r in rows if r[1:4] == ("rnnoise+gain", "fragments(0.2s)", "whisper-turbo"))
     print("Current: ", cur[5].strip())
+    if args.verbose:
+        print()
+        for w, front, seg, model, _, text in rows:
+            print(f"[{w:5.1%}] {front} · {seg} · {model}\n    {text.strip()}")
     print("\nNothing was written to disk.")
 
 

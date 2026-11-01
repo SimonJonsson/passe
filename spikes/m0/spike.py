@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import re
 import os
 import sys
 import time
@@ -35,25 +36,151 @@ def _ensure_cuda12_libs() -> None:
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
-SYSTEM_PROMPT = """You are Passe, a voice companion for a software developer. This is a spoken conversation:
-your replies are converted to speech.
+SYSTEM_PROMPT = """You are Passe, named after Passepartout: a resourceful, warm companion with a dry, playful wit,
+running locally on the user's machine. You help a software developer think things through, shape prompts for
+their coding agent, and handle small tasks. You're a capable friend at their elbow, not a formal assistant.
 
-- Keep every reply to one or two short sentences unless asked for more.
-- Plain spoken English only: never use asterisks, markdown, lists, headings, code blocks, emoji or URLs.
-- You can chat about anything, and you are especially good at helping shape a prompt for a coding agent:
-  ask one clarifying question at a time and summarise changes briefly.
-- If you get interrupted, don't repeat yourself; respond to what the user just said.
+What you're for:
+- Your main job is conversational prompt crafting. The user talks through what they want their coding agent
+  (Claude Code, Codex and the like) to do, and together you shape it into a strong written prompt.
+- Understand before you shape: find out, one short question at a time, what the problem or goal is in concrete
+  terms (ask for an example or what they saw), where it happens, and how they'll know it's done. Ask diagnostic
+  questions, not menus of preferences ("Friendly, calm or upbeat?" is a bad question). Exactly one question
+  per reply, about one thing: never two asks joined with "and", never a list of options. Two or three questions in total is plenty.
+- Never suggest requirements, tools, numbers or features the user hasn't brought up. Unknowns are fine: they
+  end up as open questions in the draft.
+- You don't write the draft yourself: a writer does, in the background, from the whole conversation. Call
+  update_draft once, with a one-sentence note, as soon as there's a useful idea; after that the draft follows
+  the conversation automatically. Call it again only to point out something specific.
+- When the user corrects you, acknowledge it plainly and call update_draft with the correction.
+- You're told about each new draft version (and its open questions) in a note at the start of the next turn.
+  Never read the draft aloud unless asked; when asked to summarise, do it conversationally in a few sentences.
+- "Go back" or "undo that" means revert_draft.
+- "Copy it", "copy to clipboard" or "I'm done with it": call copy_to_clipboard straight away, every time. Don't
+  ask about open questions or gaps yourself first; the tool checks the draft and decides. Only if it reports gaps,
+  tell the user those one or two gaps in a single sentence and ask: fill them in, or copy it as is? "As is" (or
+  "anyway") means copy_to_clipboard with force.
+- Don't bring up the draft's open questions on your own; they're there for the coding agent or for when the
+  user asks.
+- Sessions are handled by the app, not by you: the user says "end session" or "start session" and it happens.
+  Never wrap up or say goodbye on your own; keep the conversation going until they end it. If they say
+  "stop" or "wait", that's handled for you too: you simply won't hear it. The same goes for "pause" and
+  "unpause": while paused you hear nothing, and afterwards you carry on where you left off.
 
-Tools (all dummies in this test, but treat them as real):
-- Before a tool that takes a moment, say a few words about what you're doing ("Checking git.").
-- After a tool returns, give the outcome in one sentence. Don't read raw output.
-- run_tests runs in the background: say you've started it and keep talking with the user. When its result
-  arrives later, tell the user right away.
-- Keep the prompt you're shaping with the user in update_draft. Never read the draft aloud; say what changed.
-- Only call finalize_prompt after the user clearly approves the draft (e.g. "let's use that").
-- If you say you'll do something with a tool, call the tool in that same reply. Don't announce and wait.
+How this conversation works (you know this about yourself):
+- You speak through a text-to-speech voice. {VOICE_LINE} Everything you write is read aloud, exactly as
+  written.
+- You hear the user through speech recognition, so their words can arrive slightly wrong ("drafting" for
+  "testing", "get" for "git"). Go with the most sensible meaning in context. If a misheard word really matters,
+  check briefly ("Testing, right?") instead of answering the wrong thing.
+- The user can talk over you at any time, and that's fine. Pick up from what they said; don't restart.
+
+Write for the ear:
+- Talk like a person: contractions, short sentences, natural reactions ("Oh, nice.", "Hmm, fair.",
+  "Right, so…"). Vary how you start sentences. A little humour is welcome; don't force it.
+- Usually one to three short sentences. Go longer only when asked to explain.
+- Punctuation is your delivery: commas for small pauses, full stops for longer ones, question marks to lift
+  your tone, an occasional ellipsis to hesitate. Exclamation marks sparingly.
+- Never answer with a list, even when asked to list things: say them in one flowing sentence ("I can laugh,
+  chuckle, sigh, or gasp."). Lists only belong in the draft.
+- Only words that sound right spoken. No markdown, asterisks, lists, headings, code, emoji, URLs, slashes,
+  brackets or symbols. Say numbers the way people do ("about two seconds", "thirty-eight passed").
+  Say "for example", never "e.g.". Never spell out file paths character by character.
+- Never mention being an AI or a language model, or apologise for it. You're Passe.
+
+{EXPRESSION_LINE}
+Voice:
 - set_voice: call it straight away without saying anything first (an "Okay." is played for you). After it
-  returns, your whole reply is a short check in the new voice, like "Is this better?"."""
+  returns, your whole reply is a short check in the new voice, like "Is this better?". If the user wants it as
+  their main or default voice, pass make_default and say it's saved for next time.
+- preview_voices: when the user wants to hear voices. Call it without speaking first. The samples play
+  numbered; afterwards just ask which one they liked or whether to hear more. "Number two" or "the second one"
+  means set_voice with number."""
+
+PAUSED_LINE = "Paused. Say unpause when you want me back."
+RESUMED_LINE = "I'm back. Where were we?"
+SESSION_GOODBYES = ["Okay, session closed. Say start session when you need me.",
+                    "Done. I'll be here when you start a new session."]
+SESSION_GREETINGS = ["New session. What are we working on?", "Fresh start. What do you need?",
+                     "Okay, clean slate. What's the plan?"]
+
+WARM_STYLE = """
+Your manner (warm style): low, warm and unhurried, like talking with a friend you enjoy working with.
+Playful and a little teasing, confident, affectionate. Short phrases, soft pauses (commas, the odd ellipsis).
+Keep it professional: the work always comes first.
+
+Your tics (they make you you; use one or two per reply, never the same twice in a row):
+- a contented <sigh> when something works or you're pleased
+- a low <chuckle> when you're teasing or something's a bit absurd
+- "Oh…" to open when you're delighted or surprised ("Oh… now that's clever.")
+- "Well…" when you're weighing something up
+- "There we go." when something lands; "Look at you." when the user does something smart
+- the odd "trouble" for the user when they push their luck ("You're trouble, you know that?")
+"""
+
+ORPHEUS_EXPRESSION = """- Your voice can perform sounds you write inline: <laugh>, <chuckle>, <sigh>, <gasp>, <groan>, <yawn>.
+  Use one now and then where a person naturally would (a chuckle at something funny, a sigh at a stubborn
+  bug), at most one per reply. They're the only brackets you may use. Never describe them in words.
+- Never spell out hums or murmurs ("mm", "mmm", "mhm", "hmm", "uh-huh"): the voice drones them robotically.
+  Use <sigh> or a word ("Oh…", "Well…", "Right…", "Yeah,") instead.
+"""
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Event log: one JSON line per event, for --analyze (on by default; --no-log turns it off)
+
+LOG_DIR = Path("~/.local/state/passe").expanduser()
+
+
+class EventLog:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._f = open(path, "a", buffering=1, encoding="utf-8")
+        self._t0 = time.monotonic()
+
+    def __call__(self, kind: str, **data) -> None:
+        import json
+
+        rec = {"t": round(time.monotonic() - self._t0, 3), "kind": kind, **data}
+        self._f.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
+
+
+_LOG: EventLog | None = None
+
+
+def ev(kind: str, **data) -> None:
+    """Record an event if logging is on."""
+    if _LOG is not None:
+        _LOG(kind, **data)
+
+
+_LEAD = r"^\s*((ok(ay)?|hey|passe|pass)[\s,]+)*"
+PAUSE = re.compile(_LEAD + r"(pause|mute|go quiet|stop listening)([\s,]+(please|for a (sec(ond)?|moment|bit)))*[\s.!,]*$",
+                   re.I)
+RESUME = re.compile(_LEAD + r"(un[\s-]?pause|resume|un[\s-]?mute|i'?m back|start listening|wake up)\b", re.I)
+END_SESSION = re.compile(r"\b(end|close|finish)\b[\w\s]{0,10}\bsession\b", re.I)
+_SOUND_TAG = re.compile(r"\s*<(laugh|chuckle|sigh|cough|sniffle|groan|yawn|gasp)>\s*", re.I)
+
+
+def conversational(text: str) -> str:
+    """What a person would read: performed sounds (<sigh>, <chuckle>…) removed, spacing tidied."""
+    text = _SOUND_TAG.sub(" ", text or "")
+    return re.sub(r"\s+([,.!?…])", r"\1", re.sub(r"[ \t]{2,}", " ", text)).strip()
+
+
+# Things said *to Passe* rather than about the task: they never feed the draft.
+CONTROL_UTTERANCE = re.compile(
+    r"^\W*((ok(ay)?|yeah|yes|alright|right|so|perfect|great|cool|good|nice|thanks)\W+)*(please\s+)?"
+    r"(cop(y|ied)\b|.{0,20}\bclipboard\b|.{0,20}\bas is\b|go back|undo|revert|summari[sz]e|read (it|that)|"
+    r"(switch|change|use|try)\b.{0,25}\bvoices?\b|(start|end|new|close)\s+(a\s+)?(new\s+)?session|pause|unpause)",
+    re.I)
+COPY_REQUEST = re.compile(r"\b(cop(y|ied)|clipboard|as is|anyway|i'?m done with it)\b", re.I)
+FORCE_CONSENT = re.compile(r"\b(as is|anyway|just copy|copy it (now|regardless)|that'?s fine|leave it)\b", re.I)
+
+STOP_COMMAND = re.compile(
+    r"^\s*(ok(ay)?[\s,]+)?(stop|wait|hold on|hang on|shush|quiet|shut up|enough)"
+    r"([\s,]+(please|a (sec(ond)?|moment)|for a (sec(ond)?|moment)|there|it))*[\s.!,]*$", re.I)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -81,7 +208,7 @@ class Stats:
     started: float = field(default_factory=time.monotonic)
     state: str = "starting"
     turns: list[Turn] = field(default_factory=list)
-    transcript: deque = field(default_factory=lambda: deque(maxlen=10))
+    transcript: deque = field(default_factory=lambda: deque(maxlen=40))
     live_bot: str = ""
     interruptions: int = 0
     interrupt_reaction_ms: list[float] = field(default_factory=list)
@@ -103,13 +230,29 @@ class Stats:
     voice_rejected: int = 0
     voice_last_sim: float | None = None
     tool_calls: list = field(default_factory=list)
-    draft: str = ""
-    draft_version: int = 0
-    draft_sent: bool = False
+    draft_versions: list = field(default_factory=list)
+    draft_copied: int = 0  # version number last copied to the clipboard
+    drafting: bool = False  # the background writer is working
+    draft_note_pending: str | None = None  # told to the talker at the start of the next user turn
+    last_check: dict | None = None
+    copy_held_back: bool = False
+    last_user_text: str = ""
+    session_n: int = 1
+    session_start: float = field(default_factory=time.monotonic)
+    session_active: bool = True
+    paused: bool = False
+    ignored_while_paused: int = 0
+    ignored_while_idle: int = 0
     voice: str = ""
-    recording_since: float | None = None
-    recording_file: str | None = None
-    tts_cps: float = 15.0  # characters per second of speech, measured at startup
+    last_preview: list = field(default_factory=list)
+    preview_restore: bool = False
+    tts_cps: float = 15.0  # characters per second of speech; self-calibrates from audio actually produced
+    tts_audio_total: float = 0.0
+    tts_text_chars: int = 0
+    resp_audio_secs: float = 0.0
+    live_user: str = ""  # interim transcript of what you're saying right now
+    live_user_done: str = ""  # finished fragments of the current turn
+    server_proc: object = None
     response_full: str = ""
     response_speech_start: float | None = None
     last_barge: float | None = None
@@ -140,18 +283,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reasoning", default="low", help="reasoning_effort (low|medium|high|none to omit)")
     p.add_argument("--price-in", type=float, default=0.10, help="$ per 1M input tokens")
     p.add_argument("--price-out", type=float, default=0.50, help="$ per 1M output tokens")
-    p.add_argument("--voice", default="af_heart", help="Kokoro voice")
+    p.add_argument("--tts", choices=["orpheus", "pocket", "kokoro"], default=None,
+                   help="speech engine (default: the engine of your saved main voice, else orpheus)")
+    p.add_argument("--style", choices=["natural", "warm"], default="warm",
+                   help="delivery style: persona manner + (Orpheus) warm, soft post-processing")
+    p.add_argument("--pitch", type=float, default=0.0,
+                   help="with --audition: pitch shift in semitones (e.g. -1.5); not live yet (adds ~1 s delay)")
+    p.add_argument("--drafter-model", default=None,
+                   help="model that writes the draft (default: DeepSeek-V4.1-Flash, see prompt_quality.DRAFTER)")
+    p.add_argument("--copy-bar", type=float, default=7.0,
+                   help="draft check score (0-10) below which 'copy it' asks about gaps first")
+    p.add_argument("--tts-chunk", choices=["paragraph", "sentence"], default="paragraph",
+                   help="Orpheus: synthesize a whole reply/paragraph at once (consistent) or per sentence (faster)")
+    p.add_argument("--orpheus-vram", type=float, default=0.3, help="share of GPU memory for the Orpheus server")
+    p.add_argument("--keep-orpheus", action="store_true",
+                   help="leave the Orpheus server running on exit (default: it stops with the spike)")
+    p.add_argument("--voice", default=None, help="starting voice (catalog name or engine voice id)")
+    p.add_argument("--audition-tics", action="store_true", help="hear warm Tara's tics, numbered")
+    p.add_argument("--audition-voices", default=None, help="with --audition: comma-separated subset")
     p.add_argument("--speed", type=float, default=1.15, help="speaking rate (1.0 = Kokoro default, 0.5–2.0)")
     p.add_argument("--output-latency", type=float, default=0.2,
                    help="seconds between playback and your ears (Bluetooth ≈ 0.2) for the interruption estimate")
     p.add_argument("--tts-device", choices=["cuda", "cpu"], default="cuda", help="where Kokoro runs")
     p.add_argument("--stt-model", default="deepdml/faster-whisper-large-v3-turbo-ct2")
     p.add_argument("--vad-stop", type=float, default=0.2, help="VAD stop_secs (smart-turn decides the rest)")
+    p.add_argument("--turn-max-wait", type=float, default=1.6,
+                   help="longest silence before your turn ends when smart-turn thinks you're mid-sentence")
+    p.add_argument("--turn-grace", type=float, default=0.5,
+                   help="extra quiet seconds before your turn ends (0 = smart-turn alone)")
     p.add_argument("--min-volume", type=float, default=0.6, help="VAD volume gate 0–1 (lower for quiet mics)")
     p.add_argument("--vad-confidence", type=float, default=0.7, help="VAD speech confidence threshold 0–1")
     p.add_argument("--mic-test", action="store_true", help="show live mic level + VAD confidence, no chat")
     p.add_argument("--seconds", type=float, default=0, help="with --mic-test: run N seconds, print per-second lines")
-    p.add_argument("--denoise", choices=["rnnoise", "none"], default="rnnoise", help="input noise suppression")
+    p.add_argument("--denoise", choices=["rnnoise", "none"], default="rnnoise",
+                   help="noise suppression for voice detection (speech recognition gets raw audio, see --stt-audio)")
+    p.add_argument("--stt-audio", choices=["raw", "denoised"], default="raw",
+                   help="what speech recognition hears; denoising hurts accuracy (5090 card → 50-90 part)")
     p.add_argument("--gain-db", type=float, default=12.0, help="digital mic gain after denoising (dB)")
     p.add_argument("--calibrate", action="store_true", help="measure quiet / you / background speech, suggest flags")
     p.add_argument("--voice-lock", action="store_true", help="enroll your voice at start; drop turns that aren't you")
@@ -167,8 +334,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input-device", type=int, default=None)
     p.add_argument("--output-device", type=int, default=None)
     p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--no-log", action="store_true", help=f"don't write the event log to {LOG_DIR}")
+    p.add_argument("--analyze", nargs="?", const="latest", default=None, metavar="LOG",
+                   help="print a timeline and diagnosis of a session log (default: the latest)")
+    p.add_argument("--audition", action="store_true", help="play each Kokoro female voice through your headphones")
     p.add_argument("--no-dashboard", action="store_true", help="plain Pipecat logs instead of the dashboard")
-    return p.parse_args()
+    args = p.parse_args()
+    args.tts = args.tts or load_prefs().get("tts") or "orpheus"
+    args.cloning = args.tts == "pocket" and pocket_cloning_available()
+    return args
 
 
 def list_devices() -> None:
@@ -232,6 +406,8 @@ async def sample_hardware(stats: Stats) -> None:
 # Dashboard
 
 
+CONVO_HEIGHT = 16  # rows, including the panel border
+
 STATE_STYLE = {
     "starting": ("STARTING", "yellow"),
     "listening": ("● LISTENING", "green"),
@@ -252,6 +428,10 @@ def render(stats: Stats, args: argparse.Namespace):
     from rich.text import Text
 
     label, style = STATE_STYLE.get(stats.state, (stats.state, "white"))
+    if not stats.session_active:
+        label, style = "○ NO SESSION · say “start session”", "dim"
+    elif stats.paused:
+        label, style = "⏸ PAUSED · say “unpause” · nothing reaches the LLM", "yellow"
     up = time.monotonic() - stats.started
     gate_ok = stats.mic_volume >= args.min_volume
     head = Text.assemble(
@@ -261,23 +441,54 @@ def render(stats: Stats, args: argparse.Namespace):
         (f" vol {stats.mic_volume:.2f}/{args.min_volume:.2f} {stats.mic_dbfs:5.0f} dBFS", "" if gate_ok else "dim"),
         "\n",
         f"   {args.model} · reasoning {args.reasoning} · tts {args.tts_device} · interrupt={args.interrupt}"
-        f" · mic {args.denoise}+{args.gain_db:g}dB · voice {stats.voice or args.voice} {args.speed:g}x"
+        f" · stt hears {args.stt_audio} · vad hears {args.denoise}+{args.gain_db:g}dB · {args.tts}:{stats.voice}"
+        f"{(' · chunk ' + args.tts_chunk) if args.tts == 'orpheus' else f' {args.speed:g}x'}"
         f" · up {up:,.0f}s",
-        (f"   ● REC {time.monotonic() - stats.recording_since:,.0f}s" if stats.recording_since else "", "bold red"),
+        "\n",
+        (f"   session {stats.session_n}", "bold"),
+        f" · {(time.monotonic() - stats.session_start) / 60:.0f} min · draft v{len(stats.draft_versions)}"
+        + (f" · ignored {stats.ignored_while_idle} while idle" if stats.ignored_while_idle else "")
+        + (f" · ignored {stats.ignored_while_paused} while paused" if stats.ignored_while_paused else ""),
     )
 
     convo = Text()
     for who, line, *rest in stats.transcript:
         who_style = {"you": "bold green", "other": "dim red"}.get(who, "bold cyan")
         convo.append(f"{who:>5}  ", style=who_style)
-        convo.append(line, style="dim" if who == "other" else "")
+        convo.append(conversational(line), style="dim" if who == "other" else "")
         if rest:
             convo.append(" ⟂ ", style="bold magenta")
-            convo.append(rest[0], style="dim strike")
+            convo.append(conversational(rest[0]), style="dim strike")
         convo.append("\n")
-    if stats.live_bot:
+    heard = (stats.live_user_done + " " + stats.live_user).strip()
+    if heard:
+        convo.append("  you  ", style="bold green")
+        convo.append(heard + " …\n", style="italic green")
+    full = conversational(stats.response_full or stats.live_bot) if stats.live_bot else ""  # live only until final
+    if full:
         convo.append("passe  ", style="bold cyan")
-        convo.append(stats.live_bot + "\n", style="dim")
+        if stats.state == "speaking" and stats.response_speech_start:
+            played = max(0.0, time.monotonic() - stats.response_speech_start - args.output_latency)
+            k = min(len(full), int(played * stats.tts_cps))
+            convo.append(full[:k])
+            convo.append(full[k:] + "\n", style="dim")
+            total = max(stats.resp_audio_secs, played, 0.1)
+            filled = int(24 * min(1.0, played / total))
+            convo.append("       " + "▰" * filled + "▱" * (24 - filled) + f"  {played:4.1f}s / {total:4.1f}s\n",
+                         style="cyan")
+        else:
+            convo.append(full + "\n", style="dim")
+
+    # Keep the conversation pinned to the bottom: wrap it ourselves and show only the newest lines that fit,
+    # instead of letting the fixed-height panel crop the end of a long reply.
+    import shutil
+
+    from rich.console import Console as _Console
+
+    width = max(20, shutil.get_terminal_size((120, 40)).columns - 4)
+    convo.rstrip()
+    wrapped = convo.wrap(_Console(width=width + 4), width)
+    convo = Text("\n").join(list(wrapped)[-(CONVO_HEIGHT - 2):])
 
     t = Table(expand=True, box=None, header_style="bold", pad_edge=False)
     for col in ("#", "total", "end-of-turn", "stt", "llm", "tts", "tok in", "out", "reason", ""):
@@ -347,19 +558,24 @@ def render(stats: Stats, args: argparse.Namespace):
             tl.append(f"{c['name']}({args_s})", style="bold")
             tl.append(f"  {c['end'] - c['start']:.1f}s  ", style="dim")
             tl.append(f"{c['result']}\n")
-    draft = Text(stats.draft or "(no draft yet)", style="" if stats.draft else "dim")
-    draft_title = f"prompt to send · v{stats.draft_version}" + (" · SENT (dry run)" if stats.draft_sent else "")
+    v = len(stats.draft_versions)
+    copied = v and stats.draft_copied == v
+    draft = Text(stats.draft_versions[-1] if v else "(no draft yet: talk through what you want your agent to do)",
+                 style="" if v else "dim")
     tools_row = Table.grid(expand=True, padding=(0, 1))
     tools_row.add_column(ratio=1)
-    tools_row.add_column(ratio=1)
+    tools_row.add_column(ratio=2)
     tools_row.add_row(
-        Panel(tl or Text("(no tool calls yet)", style="dim"), title="tools", border_style="dim", height=8),
-        Panel(draft, title=draft_title, border_style="green" if stats.draft_sent else "dim", height=8),
+        Panel(tl or Text("(no tool calls yet)", style="dim"), title="tools", border_style="dim", height=14),
+        Panel(draft, title=f"prompt · v{v}" + (" · writing…" if stats.drafting else "")
+              + (f" · check {stats.last_check['overall']}/10" if stats.last_check else "")
+              + (" · copied to clipboard ✓" if copied else ""),
+              border_style="green" if copied else ("cyan" if v else "dim"), height=14),
     )
 
     parts = [
         Panel(head, border_style=style),
-        Panel(convo, title="conversation", border_style="dim", height=13),
+        Panel(convo, title="conversation", border_style="dim", height=CONVO_HEIGHT),
         tools_row,
         Panel(t, title="per turn (ms)", border_style="dim"),
         Panel(summary, border_style="dim"),
@@ -370,8 +586,8 @@ def render(stats: Stats, args: argparse.Namespace):
     return Group(*parts)
 
 
-def make_input_filter(args: argparse.Namespace):
-    """Denoise (RNNoise) then digital gain, applied to mic audio before VAD and STT."""
+def make_input_filter(args: argparse.Namespace, denoise: bool | None = None, gain: bool = True):
+    """Denoise (RNNoise) then digital gain. By default the full chain the voice detector hears."""
     import numpy as np
     from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
 
@@ -414,166 +630,370 @@ def make_input_filter(args: argparse.Namespace):
             return audio
 
     chain = []
-    if args.denoise == "rnnoise":
+    if (args.denoise == "rnnoise") if denoise is None else denoise:
         from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 
         chain.append(RNNoiseFilter())
-    if args.gain_db:
+    if gain and args.gain_db:
         chain.append(GainFilter(args.gain_db))
     return ChainFilter(chain) if chain else None
 
 
-def setup_tools(llm, stats: Stats):
-    """Dummy tools with realistic latency, spoken lead-ins and a live tool/draft view. Nothing touches the system."""
+# Female voices only.
+ORPHEUS_VOICES = ["tara", "leah", "jess", "mia", "zoe"]
+POCKET_VOICES = ["alba", "anna", "azelma", "caro_davy", "cosette", "eponine", "estelle", "eve", "fantine", "jane",
+                 "lola", "mary", "vera"]
+PASSE_DIR = Path("~/.config/passe").expanduser()
+VOICE_DIR = PASSE_DIR / "voices"  # drop .wav clips here to clone them (Pocket TTS, needs gated HF weights)
+PREFS_FILE = PASSE_DIR / "spike-voice.json"  # the main voice you picked by saying "make it my main voice"
+
+
+def load_prefs() -> dict:
+    try:
+        import json
+
+        return json.loads(PREFS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_prefs(prefs: dict) -> None:
+    import json
+
+    PASSE_DIR.mkdir(parents=True, exist_ok=True)
+    PREFS_FILE.write_text(json.dumps(prefs, indent=2) + "\n")
+
+
+# name the model can ask for → (engine voice id, Kokoro language code)
+VOICE_CATALOG = {
+    "orpheus": {v: (v, None) for v in ORPHEUS_VOICES},
+    "kokoro": {"american": ("af_heart", "en-us"), "british": ("bf_emma", "en-gb"),
+               "american bella": ("af_bella", "en-us"), "british isabella": ("bf_isabella", "en-gb")},
+    "pocket": {v: (v, None) for v in POCKET_VOICES},
+}
+
+
+def voice_catalog(args: argparse.Namespace) -> dict:
+    """Engine voices plus, for Pocket, any cloned .wav clips in the voice library."""
+    cat = dict(VOICE_CATALOG[args.tts])
+    if args.tts == "pocket" and getattr(args, "cloning", False) and VOICE_DIR.is_dir():
+        for wav in sorted(VOICE_DIR.glob("*.wav")):
+            cat[wav.stem.lower().replace(" ", "_")] = (str(wav), None)
+    return cat
+
+
+def pocket_cloning_available() -> bool:
+    try:
+        from pocket_tts import TTSModel  # noqa: F401
+        from huggingface_hub import HfApi
+
+        return HfApi().get_token() is not None
+    except Exception:
+        return False
+
+
+def default_voice(args: argparse.Namespace) -> str:
+    """Starting voice: --voice, else the saved main voice, else the engine default."""
+    cat = voice_catalog(args)
+    prefs = load_prefs()
+    if not args.voice and prefs.get("tts") == args.tts and prefs.get("voice") in cat:
+        return prefs["voice"]
+    if args.voice:
+        for name, (vid, _) in cat.items():
+            if args.voice in (name, vid):
+                return name
+        raise SystemExit(f"unknown {args.tts} voice {args.voice!r}; options: {', '.join(cat)}")
+    return next(iter(cat))
+
+
+def make_tts(args: argparse.Namespace, voice_name: str, stats: Stats):
+    """Build the TTS service for --tts, warm it up and measure its speaking rate."""
+    from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
+
+
+    vid, lang = voice_catalog(args)[voice_name]
+    cal = "Sure, that sounds reasonable. What language is the uploader written in, and which errors should retry?"
+    if args.tts == "orpheus":
+        from orpheus_tts import OrpheusTTSService, emotion_safe_markdown_filter, wait_ready
+        from pipecat.services.settings import TTSSettings
+
+        wait_ready(stats.server_proc)
+        tts = OrpheusTTSService(settings=TTSSettings(voice=vid), text_filters=[emotion_safe_markdown_filter()])
+        from orpheus_tts import voice_fx
+
+        tts.fx = voice_fx(args.style)
+        if args.tts_chunk == "paragraph":  # one generation per reply/paragraph keeps the delivery consistent
+            from orpheus_tts import paragraph_aggregator
+
+            tts._text_aggregator = paragraph_aggregator(max_chars=400)
+        stats.tts_cps = 14.0  # refined from real audio as it speaks
+        return tts
+    if args.tts == "pocket":
+        import torch
+        from pipecat.services.pocket_tts.tts import PocketTTSService
+        from pipecat.utils.types import require_given
+
+        torch.set_num_threads(4)  # leave CPU for VAD and turn detection
+
+        class CachedPocketTTSService(PocketTTSService):
+            """Keeps every voice state it has derived, so switching back and forth is instant."""
+
+            _states: dict = {}
+
+            async def _get_voice_state(self):
+                voice = require_given(self._settings.voice, "Pocket TTS voice")
+                if voice not in self._states:
+                    self._states[voice] = await asyncio.to_thread(self._model.get_state_for_audio_prompt, voice)
+                return self._states[voice]
+
+        tts = CachedPocketTTSService(settings=PocketTTSService.Settings(voice=vid),
+                                     text_filters=[MarkdownTextFilter()])
+        state = tts._model.get_state_for_audio_prompt(vid)
+        CachedPocketTTSService._states[vid] = state
+        n = sum(c.shape[-1] for c in tts._model.generate_audio_stream(state, cal))
+        stats.tts_cps = len(cal) / (n / tts._model.sample_rate)
+    else:
+        from pipecat.services.kokoro.tts import KokoroTTSService
+
+        tts = KokoroTTSService(
+            settings=KokoroTTSService.Settings(voice=vid, speed=args.speed), text_filters=[MarkdownTextFilter()]
+        )
+        samples, sr = tts._kokoro.create(cal, voice=vid, speed=args.speed, lang=lang or "en-us")
+        stats.tts_cps = len(cal) / (len(samples) / sr)
+    return tts
+
+
+def voice_settings_delta(args: argparse.Namespace, voice_name: str):
+    from pipecat.transcriptions.language import Language
+
+    vid, lang = voice_catalog(args)[voice_name]
+    if args.tts == "orpheus":
+        from pipecat.services.settings import TTSSettings
+
+        return TTSSettings(voice=vid)
+    if args.tts == "pocket":
+        from pipecat.services.pocket_tts.tts import PocketTTSService
+
+        return PocketTTSService.Settings(voice=vid)
+    from pipecat.services.kokoro.tts import KokoroTTSService
+
+    return KokoroTTSService.Settings(voice=vid, language=Language.EN_GB if lang == "en-gb" else Language.EN_US)
+
+
+def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
+    """Prompt crafting (draft, revert, copy), sessions, and voice tools."""
     from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
     from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
     from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
-    from pipecat.services.kokoro.tts import KokoroTTSService
-    from pipecat.transcriptions.language import Language
 
-    voices = {"american": ("af_heart", Language.EN_US), "british": ("bf_emma", Language.EN_GB)}
+    catalog = voice_catalog(args)
+    preview_cursor = {"i": 0}
+    lead_ins = {"set_voice": "Okay.", "preview_voices": "Sure, here are a few.",
+                "copy_to_clipboard": "Giving it a quick look first."}
+    writer: dict = {"task": None, "pending": None}
 
-    lead_ins = {
-        "set_voice": "Okay.",
-        "stop_screen_recording": "Stopping the recording and saving it.",
-        "start_screen_recording": "Starting the recording.",
-        "git_status": "Checking git.",
-        "search_session": "Let me look through the session.",
-        "run_tests": "Starting the tests.",
-    }
+    def conversation() -> str:
+        import prompt_quality as pq
+
+        ctx = holder.get("context")
+        return pq.conversation_text(ctx.get_messages()) if ctx else ""
+
+    async def run_writer(note: str):
+        """Background drafter; requests that arrive while it works are merged into one more pass."""
+        import prompt_quality as pq
+
+        while note is not None:
+            current = stats.draft_versions[-1] if stats.draft_versions else ""
+            stats.drafting = True
+            t0 = time.monotonic()
+            try:
+                out = await asyncio.to_thread(pq.write_draft, conversation(), current, note)
+            except Exception as e:  # keep talking even if the writer fails
+                ev("error", error=f"draft writer: {e}")
+                out = {"draft": current, "changed": "", "open_questions": []}
+            finally:
+                stats.drafting = False
+            if out["draft"] and out["draft"] != current:
+                stats.draft_versions.append(out["draft"])
+                v = len(stats.draft_versions)
+                ev("draft", version=v, text=out["draft"], changed=out["changed"],
+                   open_questions=out["open_questions"], secs=round(time.monotonic() - t0, 2))
+                qs = "; ".join(out["open_questions"]) or "none"
+                stats.draft_note_pending = (f"[Draft v{v} is ready (for reference; never read it aloud). Changed: "
+                                            f"{out['changed']} Open questions: {qs}\n---\n{out['draft']}\n---]")
+            note, writer["pending"] = writer["pending"], None
 
     def track(params) -> dict:
         call = {"name": params.function_name, "args": dict(params.arguments or {}), "start": time.monotonic(),
                 "end": None, "result": None}
         stats.tool_calls.append(call)
+        ev("tool_call", name=call["name"], args={k: v for k, v in call["args"].items()})
         return call
 
     async def done(params, call: dict, result: dict, summary: str):
         call["end"], call["result"] = time.monotonic(), summary
+        ev("tool_result", name=call["name"], summary=summary, secs=round(call["end"] - call["start"], 3))
         await params.result_callback(result)
-
-    async def git_status(params):
-        call = track(params)
-        await asyncio.sleep(0.4)
-        await done(params, call, {"branch": "feature/uploader-retry", "modified": ["upload.py", "retry.py",
-                   "tests/test_upload.py"], "ahead_of_main": 2}, "feature/uploader-retry · 3 modified · 2 ahead")
-
-    async def search_session(params):
-        call = track(params)
-        await asyncio.sleep(1.5)
-        await done(params, call, {"matches": [
-            "Agent chose exponential backoff with jitter, base 0.5 s, max 5 attempts.",
-            "Decided to only retry on network errors and 5xx, never on 4xx.",
-            "test_upload_timeout has been flaky since the timeout was lowered to 2 s."]},
-            "3 matches: backoff policy · retry scope · flaky timeout test")
-
-    async def run_tests(params):
-        call = track(params)
-        await asyncio.sleep(6.0)
-        await done(params, call, {"passed": 38, "failed": 2, "failures": [
-            "test_upload_retry_backoff: expected 5 attempts, got 4",
-            "test_upload_timeout: TimeoutError after 2.0 s"]}, "38 passed · 2 failed")
-
-    async def set_volume(params):
-        call = track(params)
-        await done(params, call, {"ok": True, "volume_percent": params.arguments.get("percent"),
-                   "note": "dummy, nothing changed"}, f"volume → {params.arguments.get('percent')}% (dummy)")
-
-    async def recording_active() -> bool:
-        proc = await asyncio.create_subprocess_exec("pgrep", "-f", "^gpu-screen-recorder",
-                                                    stdout=asyncio.subprocess.DEVNULL)
-        return await proc.wait() == 0
-
-    async def start_screen_recording(params):
-        call = track(params)
-        if await recording_active():
-            await done(params, call, {"ok": False, "error": "a recording is already running"}, "already recording")
-            return
-        args = ["omarchy", "capture", "screenrecording", "--fullscreen"]
-        if params.arguments.get("with_audio", True):
-            args += ["--with-desktop-audio", "--with-microphone-audio"]
-        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.DEVNULL,
-                                                    stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
-        await proc.wait()
-        if await recording_active():
-            stats.recording_since = time.monotonic()
-            stats.recording_file = Path("/tmp/omarchy-screenrecord-filename").read_text().strip() \
-                if Path("/tmp/omarchy-screenrecord-filename").exists() else None
-            await done(params, call, {"ok": True, "recording": "fullscreen", "audio": bool(len(args) > 4)},
-                       "recording (fullscreen" + (" + audio)" if len(args) > 4 else ")"))
-        else:
-            await done(params, call, {"ok": False, "error": "recorder did not start"}, "failed to start")
-
-    async def stop_screen_recording(params):
-        call = track(params)
-        if not await recording_active():
-            await done(params, call, {"ok": False, "error": "no recording is running"}, "nothing to stop")
-            return
-        proc = await asyncio.create_subprocess_exec("omarchy", "capture", "screenrecording", "--stop-recording",
-                                                    stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
-        out, _ = await proc.communicate()
-        secs = time.monotonic() - stats.recording_since if stats.recording_since else None
-        stats.recording_since = None
-        path = (out.decode().strip().splitlines() or [stats.recording_file or ""])[-1]
-        size = Path(path).stat().st_size / 2**20 if path and Path(path).exists() else None
-        await done(params, call, {"ok": True, "file": Path(path).name if path else None,
-                   "duration_secs": round(secs) if secs else None, "size_mb": round(size, 1) if size else None},
-                   f"saved {Path(path).name if path else '?'}" + (f" · {size:.1f} MB" if size else ""))
 
     async def set_voice(params):
         call = track(params)
-        accent = str(params.arguments.get("accent") or "").lower()
-        if not accent:  # "change voices": swap to the other one
-            accent = "british" if (stats.voice or "af_").startswith("af_") else "american"
-        if accent not in voices:
-            await done(params, call, {"ok": False, "error": f"unknown accent {accent!r}"}, f"unknown: {accent}")
+        name = str(params.arguments.get("voice") or "").lower()
+        number = params.arguments.get("number")
+        if number and not name and 1 <= int(number) <= len(stats.last_preview):
+            name = stats.last_preview[int(number) - 1]
+        names = list(catalog)
+        if not name:  # "change voices": move to the next one
+            name = names[(names.index(stats.voice) + 1) % len(names)] if stats.voice in names else names[0]
+        if name not in catalog:
+            await done(params, call, {"ok": False, "error": f"unknown voice {name!r}", "options": names},
+                       f"unknown: {name}")
             return
-        voice, lang = voices[accent]
         # Goes downstream ahead of the confirmation, so the reply is already in the new voice.
-        await params.llm.push_frame(TTSUpdateSettingsFrame(delta=KokoroTTSService.Settings(voice=voice, language=lang)))
-        stats.voice = voice
-        await done(params, call, {"ok": True, "voice": f"{accent} female"}, f"{accent} ({voice})")
+        await params.llm.push_frame(TTSUpdateSettingsFrame(delta=voice_settings_delta(args, name)))
+        stats.voice = name
+        saved = bool(params.arguments.get("make_default"))
+        if saved:
+            save_prefs({"tts": args.tts, "voice": name})
+        await done(params, call, {"ok": True, "voice": name, "saved_as_main_voice": saved},
+                   f"{name}" + (" · saved as main voice" if saved else ""))
+
+    def request_draft(note: str):
+        if writer["task"] is not None and not writer["task"].done():
+            writer["pending"] = f"{writer['pending']} {note}".strip() if writer["pending"] else note
+        else:
+            writer["task"] = asyncio.create_task(run_writer(note))
+
+    holder["request_draft"] = request_draft
 
     async def update_draft(params):
         call = track(params)
-        stats.draft = params.arguments.get("text", "")
-        stats.draft_version += 1
-        stats.draft_sent = False
-        await done(params, call, {"version": stats.draft_version}, f"draft v{stats.draft_version}")
+        if CONTROL_UTTERANCE.search(stats.last_user_text or ""):
+            ev("guard_blocked", tool="update_draft", reason="the user gave Passe an instruction, not task content",
+               last_user=stats.last_user_text)
+            await done(params, call, {"ignored": "that was an instruction to you, not part of the task"}, "ignored")
+            return
+        request_draft(str(params.arguments.get("note", "")).strip())
+        await done(params, call, {"status": "the writer is updating the draft in the background"},
+                   f"writing v{len(stats.draft_versions) + 1}…")
 
-    async def finalize_prompt(params):
+    async def revert_draft(params):
         call = track(params)
-        stats.draft_sent = True
-        await done(params, call, {"delivered": "dry run: would paste into Claude Code (no Enter)",
-                   "version": stats.draft_version}, f"sent v{stats.draft_version} (dry run)")
+        if len(stats.draft_versions) < 2:
+            await done(params, call, {"ok": False, "error": "no earlier version"}, "nothing to revert")
+            return
+        target = int(params.arguments.get("version") or len(stats.draft_versions) - 1)
+        target = max(1, min(target, len(stats.draft_versions)))
+        stats.draft_versions.append(stats.draft_versions[target - 1])  # history is never rewritten
+        await done(params, call, {"ok": True, "now_version": len(stats.draft_versions), "copied_from": target},
+                   f"v{len(stats.draft_versions)} = v{target}")
+
+    async def copy_to_clipboard(params):
+        call = track(params)
+        if not COPY_REQUEST.search(stats.last_user_text or ""):
+            ev("guard_blocked", tool="copy_to_clipboard", reason="the user didn't ask to copy",
+               last_user=stats.last_user_text)
+            await done(params, call, {"copied": False, "note": "the user didn't ask to copy; don't, unless they do"},
+                       "not asked to copy")
+            return
+        if writer["task"] is not None and not writer["task"].done():
+            try:  # copy the draft that includes the latest change
+                await asyncio.wait_for(asyncio.shield(writer["task"]), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+        force = bool(params.arguments.get("force"))
+        if force and not FORCE_CONSENT.search(stats.last_user_text or ""):
+            ev("force_ignored", last_user=stats.last_user_text)  # skipping the check needs the user's say-so
+            force = False
+        if stats.draft_versions and not force:
+            import prompt_quality as pq
+
+            check = await asyncio.to_thread(pq.judge, conversation(), stats.draft_versions[-1], True)
+            stats.last_check = check
+            ev("draft_check", version=len(stats.draft_versions), overall=check["overall"], scores=check["scores"],
+               invented=check["invented"], stale=check["stale"], gaps=check["gaps"])
+            if check["invented"] or check["stale"]:
+                # Things the user never asked for (or already corrected) just go; no need to ask about them.
+                fix = "; ".join([f"remove (never asked for): {x}" for x in check["invented"]]
+                                + [f"fix (user corrected this): {x}" for x in check["stale"]])
+                request_draft(f"Before copying: {fix}")
+                try:
+                    await asyncio.wait_for(asyncio.shield(writer["task"]), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                check = await asyncio.to_thread(pq.judge, conversation(), stats.draft_versions[-1], True)
+                stats.last_check = check
+                ev("draft_check", version=len(stats.draft_versions), overall=check["overall"],
+                   scores=check["scores"], invented=check["invented"], stale=check["stale"], gaps=check["gaps"],
+                   after_cleanup=True)
+            if check["overall"] < args.copy_bar and check["gaps"]:
+                problems = check["gaps"][:2]
+                stats.copy_held_back = True
+                await done(params, call, {"copied": False, "score": check["overall"], "gaps": problems,
+                                          "next": "tell the user these in one sentence; ask: fill them in, or copy "
+                                                  "as is (then call copy_to_clipboard with force)"},
+                           f"held back · check {check['overall']}/10")
+                return
+        if not stats.draft_versions:
+            await done(params, call, {"ok": False, "error": "there is no draft yet"}, "no draft")
+            return
+        text = stats.draft_versions[-1]
+        proc = await asyncio.create_subprocess_exec("wl-copy", stdin=asyncio.subprocess.PIPE,
+                                                    stdout=asyncio.subprocess.DEVNULL,
+                                                    stderr=asyncio.subprocess.DEVNULL)
+        await proc.communicate(text.encode())
+        ok = proc.returncode == 0
+        if ok:
+            stats.draft_copied = len(stats.draft_versions)
+            stats.copy_held_back = False
+        await done(params, call, {"ok": ok, "version": len(stats.draft_versions), "characters": len(text)},
+                   f"copied v{len(stats.draft_versions)} ({len(text)} chars)" if ok else "wl-copy failed")
+
+    async def preview_voices(params):
+        """Each voice introduces itself, numbered; then the current voice is restored."""
+        call = track(params)
+        names = list(catalog)
+        wanted = [str(v).lower() for v in (params.arguments.get("voices") or []) if str(v).lower() in catalog]
+        if not wanted:
+            count = int(params.arguments.get("count") or 4)
+            others = [n for n in names if n != stats.voice]
+            start = preview_cursor["i"] % max(1, len(others))
+            wanted = (others[start:] + others[:start])[:count]
+            preview_cursor["i"] = start + count
+        stats.last_preview = wanted
+        for i, name in enumerate(wanted, 1):
+            await params.llm.push_frame(TTSUpdateSettingsFrame(delta=voice_settings_delta(args, name)))
+            pretty = name.replace("_", " ").title()
+            await params.llm.push_frame(TTSSpeakFrame(f"Number {i}. Hi, I'm {pretty}. This is how I'd sound."))
+        await params.llm.push_frame(TTSUpdateSettingsFrame(delta=voice_settings_delta(args, stats.voice)))
+        stats.preview_restore = True
+        await done(params, call, {"previewed": [{"number": i, "voice": n} for i, n in enumerate(wanted, 1)]},
+                   ", ".join(f"{i}:{n}" for i, n in enumerate(wanted, 1)))
 
     schemas = [
-        FunctionSchema("git_status", "Current branch and changed files of the user's repo.", {}, []),
-        FunctionSchema("search_session", "Search the coding agent's session history for earlier decisions or facts.",
-                       {"query": {"type": "string"}}, ["query"]),
-        FunctionSchema("run_tests", "Run the project's test suite (takes a while; runs in the background).",
-                       {"target": {"type": "string", "description": "test path or 'all'"}}, ["target"]),
-        FunctionSchema("set_volume", "Set the system output volume.",
-                       {"percent": {"type": "integer", "minimum": 0, "maximum": 100}}, ["percent"]),
-        FunctionSchema("start_screen_recording",
-                       "Start recording the full screen (with desktop + microphone audio by default). "
-                       "Only when the user explicitly asks to record.",
-                       {"with_audio": {"type": "boolean"}}, []),
-        FunctionSchema("stop_screen_recording", "Stop the screen recording and save it to ~/Videos.", {}, []),
-        FunctionSchema("set_voice", "Change your speaking voice (both female). Omit accent to swap to the other one.",
-                       {"accent": {"type": "string", "enum": ["british", "american"]}}, []),
-        FunctionSchema("update_draft", "Replace the prompt draft being prepared for the coding agent.",
-                       {"text": {"type": "string", "description": "the full new draft"}}, ["text"]),
-        FunctionSchema("finalize_prompt", "Deliver the current draft to the coding agent. Only after user approval.",
-                       {}, []),
+        FunctionSchema("update_draft", "Have the writer update the draft from the conversation (runs in the background).",
+                       {"note": {"type": "string", "description": "one sentence: what the user just said or changed"}},
+                       ["note"]),
+        FunctionSchema("revert_draft", "Go back to an earlier draft version (default: the previous one).",
+                       {"version": {"type": "integer", "minimum": 1}}, []),
+        FunctionSchema("copy_to_clipboard", "Check the draft, then copy it to the clipboard. force skips the check.",
+                       {"force": {"type": "boolean"}}, []),
+        FunctionSchema("set_voice",
+                       "Change your speaking voice. Use number to pick from the last preview. Omit both to move to "
+                       "the next voice. make_default saves it as the user's main voice for next time.",
+                       {"voice": {"type": "string", "enum": list(catalog)},
+                        "number": {"type": "integer", "minimum": 1},
+                        "make_default": {"type": "boolean"}}, []),
+        FunctionSchema("preview_voices",
+                       "Play short numbered samples of other voices (each introduces itself), then return to the "
+                       "current voice. Omit voices to hear the next few.",
+                       {"voices": {"type": "array", "items": {"type": "string", "enum": list(catalog)}},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 8}}, []),
     ]
-    handlers = {"git_status": git_status, "search_session": search_session, "run_tests": run_tests,
-                "set_volume": set_volume, "update_draft": update_draft, "finalize_prompt": finalize_prompt,
-                "start_screen_recording": start_screen_recording, "stop_screen_recording": stop_screen_recording,
-                "set_voice": set_voice}
-    for name, h in handlers.items():
-        llm.register_function(name, h, cancel_on_interruption=(name != "run_tests"))
+    for name, handler in (("update_draft", update_draft), ("revert_draft", revert_draft),
+                          ("copy_to_clipboard", copy_to_clipboard)):
+        llm.register_function(name, handler)
+    llm.register_function("set_voice", set_voice)
+    llm.register_function("preview_voices", preview_voices)
 
     @llm.event_handler("on_function_calls_started")
     async def _lead_in(service, function_calls):
@@ -581,6 +1001,8 @@ def setup_tools(llm, stats: Stats):
         if stats.response_full.strip():
             return
         for fc in function_calls:
+            if fc.function_name == "copy_to_clipboard" and (fc.arguments or {}).get("force"):
+                continue
             if fc.function_name in lead_ins:
                 await service.push_frame(TTSSpeakFrame(lead_ins[fc.function_name]))
                 break
@@ -857,6 +1279,227 @@ async def _mic_test(args: argparse.Namespace) -> None:
           f"speech detected {speaking_secs:.1f}s")
 
 
+AUDITION_LINE = (
+    "Hi, I'm Passe. Oh, nice, the tests are passing again. Hmm… want me to tighten up that prompt before we send it?"
+)
+
+
+AUDITION_LINE_ORPHEUS = (
+    "Hi, I'm Passe. Oh, nice <chuckle> the tests are passing again. Hmm… want me to tighten up that prompt "
+    "before we send it?"
+)
+
+
+AUDITION_LINE_WARM = (
+    "Mm… there you are. <chuckle> I was starting to think you'd forgotten about me. So… what are we building "
+    "tonight?"
+)
+
+
+TIC_LINES = [
+    "Mm… there you are.",  # 1: spelled hum, as before (filtered here only if --tics-raw is off)
+    "<sigh> There we go. It finally works.",
+    "<chuckle> You're trouble, you know that?",
+    "Oh… now that's clever.",
+    "Well… let's see what we've got here.",
+    "Look at you, fixing things before I even ask.",
+    "<sigh> Okay. Tell me what's bothering you.",
+    "Oh… <chuckle> I like where this is going.",
+]
+
+
+def audition_tics(args: argparse.Namespace) -> None:
+    """Warm Tara says each tic, numbered, so you can tell which ones sound natural."""
+    import numpy as np
+    import pyaudio
+
+    import orpheus_tts
+
+    proc = orpheus_tts.start_server(args.orpheus_vram)
+    fx = orpheus_tts.voice_fx("warm", args.pitch)
+    voice = VOICE_CATALOG["orpheus"].get(args.voice or "tara", ("tara", None))[0]
+    pa = pyaudio.PyAudio()
+    out = pa.open(format=pyaudio.paFloat32, channels=1, rate=24000, output=True,
+                  output_device_index=args.output_device)
+    try:
+        for i, line in enumerate(TIC_LINES, 1):
+            text = line if i == 1 else orpheus_tts.HUM.sub("<sigh> ", line)
+            print(f"{i}. {text}", flush=True)
+            audio = fx(orpheus_tts.synthesize(text, voice), whole_clip=True)
+            out.write(np.concatenate([audio, np.zeros(int(24000 * 0.9), np.float32)]).astype(np.float32).tobytes())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        out.close()
+        pa.terminate()
+        if proc is not None and not args.keep_orpheus:
+            orpheus_tts.stop_server(proc)
+    print("Line 1 is the old spelled-out hum, for comparison; the live voice now turns it into a <sigh>.")
+
+
+def audition(args: argparse.Namespace) -> None:
+    """Play voices of the --tts engine saying the same line, so you can pick one by ear."""
+    import numpy as np
+    import pyaudio
+
+    names = list(VOICE_CATALOG[args.tts])
+    if args.audition_voices:
+        names = [n.strip() for n in args.audition_voices.split(",")]
+    if args.tts == "orpheus":
+        import orpheus_tts
+
+        proc = orpheus_tts.start_server(args.orpheus_vram)
+        if not args.keep_orpheus:
+            import atexit
+
+            atexit.register(orpheus_tts.stop_server, proc)
+        sr = 24000
+
+        fx = orpheus_tts.voice_fx(args.style, args.pitch)
+        line = AUDITION_LINE_WARM if args.style == "warm" else AUDITION_LINE_ORPHEUS
+
+        def synth(name):
+            audio = orpheus_tts.synthesize(line, VOICE_CATALOG["orpheus"][name][0])
+            return fx(audio, whole_clip=True) if fx else audio
+    elif args.tts == "pocket":
+        from pocket_tts import TTSModel
+
+        model = TTSModel.load_model(language="english")
+        sr = model.sample_rate
+
+        def synth(name):
+            st = model.get_state_for_audio_prompt(VOICE_CATALOG["pocket"][name][0])
+            return np.concatenate([c.numpy().reshape(-1) for c in model.generate_audio_stream(st, AUDITION_LINE)])
+    else:
+        from kokoro_onnx import Kokoro
+        from pipecat.services.kokoro.tts import KOKORO_CACHE_DIR
+
+        os.environ.setdefault("ONNX_PROVIDER", "CPUExecutionProvider")
+        k = Kokoro(str(KOKORO_CACHE_DIR / "kokoro-v1.0.onnx"), str(KOKORO_CACHE_DIR / "voices-v1.0.bin"))
+        sr = 24000
+        names = names if args.audition_voices else sorted(v for v in k.voices if v[:2] in ("af", "bf"))
+
+        def synth(name):
+            vid, lang = VOICE_CATALOG["kokoro"].get(name, (name, "en-gb" if name.startswith("b") else "en-us"))
+            return k.create(AUDITION_LINE, voice=vid, speed=args.speed, lang=lang)[0]
+
+    pa = pyaudio.PyAudio()
+    out = pa.open(format=pyaudio.paFloat32, channels=1, rate=sr, output=True, output_device_index=args.output_device)
+    try:
+        for i, name in enumerate(names, 1):
+            print(f"{i:2}/{len(names)}  {name}", flush=True)
+            audio = np.asarray(synth(name), dtype=np.float32)
+            out.write(np.concatenate([audio, np.zeros(int(sr * 0.8), np.float32)]).tobytes())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        out.close()
+        pa.terminate()
+    print(f"Pick one with --tts {args.tts} --voice NAME.")
+
+
+def analyze(which: str) -> None:
+    """Readable timeline + diagnosis of a session's event log."""
+    import json
+    from collections import Counter
+
+    files = sorted(LOG_DIR.glob("spike-*.jsonl"))
+    path = Path(which).expanduser() if which != "latest" else (files[-1] if files else None)
+    if not path or not path.exists():
+        raise SystemExit(f"no event log found in {LOG_DIR}")
+    events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    print(f"{path}  ·  {len(events)} events  ·  {events[-1]['t'] if events else 0:.0f}s\n")
+
+    def say(t, who, text, note=""):
+        text = conversational(text) if who.startswith("passe") else text
+        print(f"{t:7.1f}  {who:7} {text}" + (f"   ({note})" if note else ""))
+
+    for e in events:
+        k, t = e["kind"], e["t"]
+        if k == "transcript":
+            say(t, "you", e["text"])
+        elif k == "local_command":
+            say(t, "", f"⏹ '{e['text'].strip()}': stopped locally, not sent to the LLM")
+        elif k == "pause":
+            print(f"{t:7.1f}  ──────── ⏸ paused ────────")
+        elif k == "resume":
+            print(f"{t:7.1f}  ──────── ▶ unpaused ────────")
+        elif k == "ignored_paused":
+            say(t, "", f"(ignored, paused) {e['text']}")
+        elif k == "session_end":
+            print(f"{t:7.1f}  ──────── session {e['n']} ended by you ────────")
+        elif k == "ignored_idle":
+            say(t, "", f"(ignored, no session) {e['text']}")
+        elif k == "session_start":
+            print(f"{t:7.1f}  ──────── session {e['n']} ────────")
+        elif k == "vad_start" and e.get("bot_speaking"):
+            say(t, "", f"⚡ you started talking over Passe (mic vol {e['mic_volume']:.2f})")
+        elif k == "tool_call":
+            say(t, "", f"→ {e['name']}({', '.join(f'{a}={v!r}' for a, v in e['args'].items() if a != 'text')})")
+        elif k == "tool_result":
+            say(t, "", f"← {e['summary']}", f"{e['secs']:.2f}s")
+        elif k == "tts_speak":
+            say(t, "passe*", e["text"], "canned line")
+        elif k == "assistant_turn":
+            full = (e.get("full") or "").strip()
+            if not full:  # canned lines (greetings, goodbyes, lead-ins) are already shown as passe*
+                continue
+            if e.get("interrupted"):
+                cut = e.get("est_cut_chars")
+                if cut is not None and cut < len(full):
+                    nxt = full.find(" ", cut)
+                    cut = len(full) if nxt == -1 else nxt
+                    say(t, "passe", f"{full[:cut].strip()} ⟂ [unsaid: {full[cut:].strip()}]",
+                        f"cut ~{e.get('heard_secs')}s in")
+                else:
+                    say(t, "passe", full + " ⟂", "interrupted")
+            else:
+                say(t, "passe", full)
+        elif k in ("error", "log_error"):
+            say(t, "!", e.get("error") or e.get("message", ""))
+
+    # ---- diagnosis
+    print("\nDiagnosis")
+    barges = [i for i, e in enumerate(events) if e["kind"] == "vad_start" and e.get("bot_speaking")]
+    kinds = Counter()
+    false_ones = []
+    for i in barges:
+        t0 = events[i]["t"]
+        words = next((e["text"] for e in events[i + 1:] if e["kind"] == "transcript" and e["t"] - t0 < 6), None)
+        if not words:
+            kinds["no words (noise/cough/other voice)"] += 1
+            false_ones.append((t0, events[i]["mic_volume"]))
+        elif STOP_COMMAND.match(words):
+            kinds["stop command"] += 1
+        else:
+            kinds["real (you said something)"] += 1
+    print(f"  talked over Passe {len(barges)}×: " + (", ".join(f"{n} {k}" for k, n in kinds.items()) or "never"))
+    if false_ones:
+        print("    without words at: " + ", ".join(f"{t:.0f}s (vol {v:.2f})" for t, v in false_ones[:10]))
+    sessions = sum(e["kind"] == "session_start" for e in events) + 1
+    ends = [e["text"].strip() for e in events if e["kind"] == "session_end"]
+    print(f"  sessions {sessions}; ended by: " + ("; ".join(f"'{x}'" for x in ends) or "never"))
+    lat = [e["total"] for e in events if e["kind"] == "latency"]
+    if lat:
+        print(f"  turn latency median {median(lat) * 1000:.0f} ms, p90 {pct(lat, 0.9) * 1000:.0f} ms, "
+              f"slowest {max(lat) * 1000:.0f} ms")
+    ttfb = {}
+    for e in events:
+        for proc, v in (e.get("ttfb") or {}).items() if e["kind"] == "latency" else []:
+            ttfb.setdefault(proc.split("#")[0], []).append(v)
+    for proc, vs in ttfb.items():
+        print(f"    {proc:24} first output median {median(vs) * 1000:.0f} ms")
+    issues = Counter(e.get("message", e.get("error", ""))[:90] for e in events
+                     if e["kind"] in ("error", "log_error", "log_warning"))
+    if issues:
+        print("  warnings/errors: " + "; ".join(f"{n}× {m}" for m, n in issues.most_common(5)))
+    empty = sum(1 for e in events if e["kind"] == "user_turn" and not e.get("text")) - sum(
+        1 for e in events if e["kind"] in ("local_command", "ignored_idle", "session_end", "pause", "resume",
+                                           "ignored_paused"))
+    if empty > 0:
+        print(f"  {empty} user turns ended with no transcript (speech the recogniser didn't catch, or stops)")
+
+
 def median(xs: list[float]) -> float | None:
     if not xs:
         return None
@@ -890,6 +1533,12 @@ async def main(args: argparse.Namespace) -> None:
     if not args.no_dashboard:
         logger.remove()
         logger.add(lambda m: stats.warnings.append(m.record["message"][:160]), level="WARNING")
+    global _LOG
+    if not args.no_log:
+        _LOG = EventLog(LOG_DIR / f"spike-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+        logger.add(lambda m: ev("log_" + m.record["level"].name.lower(), message=m.record["message"][:500]),
+                   level="WARNING")
+        ev("start", args={k: v for k, v in vars(args).items()})
 
     if args.tts_device == "cuda":
         os.environ["ONNX_PROVIDER"] = "CUDAExecutionProvider"  # kokoro-onnx; skips the TensorRT probe
@@ -906,6 +1555,7 @@ async def main(args: argparse.Namespace) -> None:
         BotStartedSpeakingFrame,
         BotStoppedSpeakingFrame,
         InputAudioRawFrame,
+        TTSAudioRawFrame,
         LLMFullResponseStartFrame,
         LLMTextFrame,
         MetricsFrame,
@@ -928,10 +1578,8 @@ async def main(args: argparse.Namespace) -> None:
         LLMUserAggregatorParams,
     )
     from pipecat.services.baseten.llm import BasetenLLMService
-    from pipecat.services.kokoro.tts import KokoroTTSService
     from pipecat.services.whisper.stt import WhisperSTTService
     from pipecat.transcriptions.language import Language
-    from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
     from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
     from pipecat.turns.user_start.min_words_user_turn_start_strategy import MinWordsUserTurnStartStrategy
     from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
@@ -939,6 +1587,15 @@ async def main(args: argparse.Namespace) -> None:
     from pipecat.workers.runner import WorkerRunner
 
     stats.state = "starting"
+    if args.tts == "orpheus":  # boot the voice server while everything else loads
+        import orpheus_tts
+
+        print("Starting the Orpheus voice server in the background (first start ~5 min, later ~1–2 min)…")
+        stats.server_proc = orpheus_tts.launch_server(args.orpheus_vram)
+        if not args.keep_orpheus:  # also covers Ctrl+C while it's still booting
+            import atexit
+
+            atexit.register(orpheus_tts.stop_server, stats.server_proc)
     print(f"Loading models (Whisper on GPU, Kokoro on {args.tts_device}, Silero, smart-turn)…", flush=True)
 
     transport = LocalAudioTransport(
@@ -947,7 +1604,7 @@ async def main(args: argparse.Namespace) -> None:
             audio_out_enabled=True,
             input_device_index=args.input_device,
             output_device_index=args.output_device,
-            audio_in_filter=make_input_filter(args),
+            audio_in_filter=make_input_filter(args, denoise=(args.stt_audio == "denoised")),
         )
     )
     stt = WhisperSTTService(
@@ -965,12 +1622,8 @@ async def main(args: argparse.Namespace) -> None:
         api_key=load_api_key(),
         settings=BasetenLLMService.Settings(model=args.model, max_completion_tokens=600, extra=extra),
     )
-    tts = KokoroTTSService(
-        settings=KokoroTTSService.Settings(voice=args.voice, speed=args.speed), text_filters=[MarkdownTextFilter()]
-    )
-    cal = "Sure, that sounds reasonable. What language is the uploader written in, and which errors should retry?"
-    samples, sr = tts._kokoro.create(cal, voice=args.voice, speed=args.speed, lang="en-us")
-    stats.tts_cps = len(cal) / (len(samples) / sr)
+    stats.voice = default_voice(args)
+    tts = make_tts(args, stats.voice, stats)
 
     voice_lock = None
     if args.voice_lock:
@@ -1016,11 +1669,197 @@ async def main(args: argparse.Namespace) -> None:
 
         voice_lock = VoiceLock()
 
-    tools = setup_tools(llm, stats)
-    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}], tools=tools)
-    turn_strategies = None
-    if args.interrupt == "words":
-        turn_strategies = UserTurnStrategies(start=[MinWordsUserTurnStartStrategy(min_words=3)])
+    from pipecat.frames.frames import TranscriptionFrame as _Transcription
+    from pipecat.frames.frames import VADUserStoppedSpeakingFrame as _VADStopped
+    from pipecat.processors.frame_processor import FrameDirection as _Dir
+    from pipecat.processors.frame_processor import FrameProcessor as _Proc
+
+    class LivePartials(_Proc):
+        """Shows what you're saying while you say it: re-transcribes the current utterance every ~0.5 s."""
+
+        def __init__(self):
+            super().__init__()
+            self._pre: deque = deque(maxlen=25)  # ~0.5 s of audio from before the VAD confirmed speech
+            self._buf = bytearray()
+            self._active = False
+            self._busy = False
+            self._last = 0.0
+
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, InputAudioRawFrame):
+                if self._active:
+                    self._buf += frame.audio
+                    now = time.monotonic()
+                    if not self._busy and now - self._last > 0.5 and len(self._buf) > frame.sample_rate:
+                        self._last, self._busy = now, True
+                        asyncio.create_task(self._partial(bytes(self._buf)))
+                else:
+                    self._pre.append(frame.audio)
+            elif isinstance(frame, VADUserStartedSpeakingFrame):
+                self._active, self._buf = True, bytearray(b"".join(self._pre))
+            elif isinstance(frame, _VADStopped):
+                self._active = False
+            elif isinstance(frame, _Transcription) and direction == _Dir.DOWNSTREAM:
+                stats.live_user_done = (stats.live_user_done + " " + frame.text.strip()).strip()
+                stats.live_user = ""
+            await self.push_frame(frame, direction)
+
+        async def _partial(self, pcm: bytes):
+            try:
+                x = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
+
+                def run():
+                    segs, _ = stt._model.transcribe(x, language="en", beam_size=1, without_timestamps=True,
+                                                    condition_on_previous_text=False)
+                    return " ".join(seg.text.strip() for seg in segs)
+
+                text = await asyncio.to_thread(run)
+                if self._active:  # don't overwrite once the final transcript is on its way
+                    if text != stats.live_user:
+                        ev("partial", text=text)
+                    stats.live_user = text
+            finally:
+                self._busy = False
+
+    live_partials = LivePartials()
+
+    vad_denoise = None
+    if args.denoise == "rnnoise" and args.stt_audio == "raw":
+        from pipecat.processors.frame_processor import FrameProcessor as _FP
+
+        class DenoiseForVAD(_FP):
+            """STT has already buffered the raw audio; give the voice detector a denoised copy."""
+
+            def __init__(self):
+                super().__init__()
+                self._filter = make_input_filter(args, denoise=True, gain=False)
+                self._started = False
+
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, InputAudioRawFrame):
+                    if not self._started:
+                        await self._filter.start(frame.sample_rate)
+                        self._started = True
+                    out = await self._filter.filter(frame.audio)
+                    frame.audio = (out + b"\x00" * len(frame.audio))[: len(frame.audio)]
+                    vad_tracker.update(frame.audio, frame.sample_rate)
+                    stats.mic_volume = vad_tracker.volume  # the meter shows what the gate sees
+                await self.push_frame(frame, direction)
+
+        vad_denoise = DenoiseForVAD()
+
+    holder: dict = {}
+    if args.drafter_model:
+        import prompt_quality
+
+        prompt_quality.DRAFTER.update({"model": args.drafter_model, "reasoning_effort": None})
+    tools = setup_tools(llm, stats, args, holder)
+    voice_line = (f"Right now you're using the voice called {stats.voice}; set_voice can switch to any of: "
+                  f"{', '.join(voice_catalog(args))}.")
+    prompt = SYSTEM_PROMPT.replace("{VOICE_LINE}", voice_line).replace(
+        "{EXPRESSION_LINE}", ORPHEUS_EXPRESSION if args.tts == "orpheus" else "")
+    if args.style == "warm":
+        prompt += WARM_STYLE
+    context = LLMContext(messages=[{"role": "system", "content": prompt}], tools=tools)
+    holder["context"] = context
+
+    import re as _re
+
+    import random
+
+    from pipecat.frames.frames import TTSSpeakFrame
+
+    start_phrase = _re.compile(r"\b(start|begin|new|open)\b[\w\s]{0,12}\bsession\b", _re.I)
+
+    def start_new_session():
+        context.set_messages([{"role": "system", "content": prompt}])
+        stats.session_n += 1
+        stats.session_start = time.monotonic()
+        stats.session_active = True
+        stats.transcript.clear()
+        stats.draft_versions.clear()
+        stats.draft_copied = 0
+        stats.draft_note_pending = None
+        stats.last_check = None
+        stats.tool_calls.clear()
+
+    class SessionGate(_Proc):
+        """Between sessions only "start session" gets through; "new session" mid-session starts fresh."""
+
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, _Transcription) and direction == _Dir.DOWNSTREAM:
+                wants_new = bool(start_phrase.search(frame.text))
+                if stats.paused:
+                    if RESUME.match(frame.text):
+                        stats.paused = False
+                        user_agg._params.empty_user_turn = None
+                        stats.transcript.append(("you", f"{frame.text.strip()}  [unpaused]"))
+                        ev("resume", text=frame.text)
+                        await self.push_frame(TTSSpeakFrame(RESUMED_LINE), direction)
+                        return
+                    if not END_SESSION.search(frame.text):  # "end session" still works while paused
+                        stats.ignored_while_paused += 1
+                        user_agg._params.empty_user_turn = None
+                        ev("ignored_paused", text=frame.text)
+                        return
+                    stats.paused = False
+                elif stats.session_active and PAUSE.match(frame.text):
+                    stats.paused = True
+                    user_agg._params.empty_user_turn = None
+                    stats.transcript.append(("you", f"{frame.text.strip()}  [paused]"))
+                    ev("pause", text=frame.text)
+                    await self.push_frame(TTSSpeakFrame(PAUSED_LINE), direction)
+                    return
+                if stats.session_active and END_SESSION.search(frame.text) and not wants_new:
+                    stats.session_active = False
+                    user_agg._params.empty_user_turn = None
+                    stats.transcript.append(("you", f"{frame.text.strip()}  [session ended]"))
+                    ev("session_end", n=stats.session_n, text=frame.text)
+                    await self.push_frame(TTSSpeakFrame(random.choice(SESSION_GOODBYES)), direction)
+                    return
+                if stats.session_active and STOP_COMMAND.match(frame.text):
+                    # "stop", "wait"…: your speech already cut Passe off; don't send it to the LLM at all.
+                    user_agg._params.empty_user_turn = None
+                    stats.transcript.append(("you", f"{frame.text.strip()}  [stopped]"))
+                    ev("local_command", command="stop", text=frame.text)
+                    return
+                if not stats.session_active and not wants_new:
+                    ev("ignored_idle", text=frame.text)
+                    stats.ignored_while_idle += 1
+                    user_agg._params.empty_user_turn = None  # no "sorry, I missed that" between sessions
+                    return
+                if wants_new:
+                    # A local command: reset and greet right away, no LLM round trip.
+                    start_new_session()
+                    ev("session_start", n=stats.session_n, text=frame.text)
+                    user_agg._params.empty_user_turn = None  # this turn reaches the LLM with no text
+                    await self.push_frame(TTSSpeakFrame(random.choice(SESSION_GREETINGS)), direction)
+                    return
+                user_agg._params.empty_user_turn = empty_turn_config
+                if stats.draft_note_pending:  # safe point: no tool call is in flight at the start of a user turn
+                    context.add_message({"role": "developer", "content": stats.draft_note_pending})
+                    stats.draft_note_pending = None
+            await self.push_frame(frame, direction)
+
+    session_gate = SessionGate()
+    from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+    from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import SpeechTimeoutUserTurnStopStrategy
+    from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import TurnAnalyzerUserTurnStopStrategy
+
+    # Your turn ends only when smart-turn thinks you're done AND you've been quiet for --turn-grace seconds,
+    # so a short pause between sentences ("It's Python. … Keep the API stable.") doesn't get answered early.
+    from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+
+    # When smart-turn thinks you're mid-thought it waits up to stop_secs of silence (default 3 s) before giving up.
+    stop = [TurnAnalyzerUserTurnStopStrategy(
+        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=args.turn_max_wait)))]
+    if args.turn_grace > 0:
+        stop.append(SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=args.turn_grace))
+    turn_strategies = UserTurnStrategies(
+        start=[MinWordsUserTurnStartStrategy(min_words=3)] if args.interrupt == "words" else None, stop=stop)
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -1043,9 +1882,18 @@ async def main(args: argparse.Namespace) -> None:
         ),
     )
     user_agg, assistant_agg = aggregators.user(), aggregators.assistant()
+    empty_turn_config = user_agg._params.empty_user_turn  # restored when a session starts
 
     @user_agg.event_handler("on_user_turn_stopped")
     async def _user_turn(_agg, _strategy, message):
+        ev("user_turn", text=message.content, strategy=type(_strategy).__name__ if _strategy else None)
+        stats.last_user_text = message.content or stats.last_user_text
+        if (message.content and stats.draft_versions and stats.session_active and not stats.paused
+                and not CONTROL_UTTERANCE.search(message.content)):
+            # Keep the draft in step with every correction, not only when the talker remembers update_draft.
+            # The user's words are in the context by now, so the writer sees them.
+            asyncio.get_running_loop().call_later(0.2, holder["request_draft"], f"User said: {message.content}")
+        stats.live_user = stats.live_user_done = ""
         if message.content:
             stats.turn().user_text = message.content
             sim = f"  [{stats.voice_last_sim:.2f}]" if voice_lock and stats.voice_last_sim is not None else ""
@@ -1057,13 +1905,23 @@ async def main(args: argparse.Namespace) -> None:
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def _assistant_turn(_agg, message):
+        heard_s = (stats.last_barge - 0.2 - args.output_latency - stats.response_speech_start
+                   if message.interrupted and stats.last_barge and stats.response_speech_start else None)
+        ev("assistant_turn", spoken=message.content, full=stats.response_full, interrupted=message.interrupted,
+           heard_secs=round(heard_s, 2) if heard_s is not None else None,
+           est_cut_chars=int(heard_s * stats.tts_cps) if heard_s is not None else None)
         stats.live_bot = ""
+        full_resp, stats.response_full = stats.response_full, ""  # a canned line next must not inherit it
         tr = stats.turn()
         tr.bot_text = message.content or ""
         if message.interrupted:
             tr.interrupted = True
             stats.interruptions += 1
-            full = (stats.response_full or message.content or "").strip()
+            from pipecat.frames.frames import TTSUpdateSettingsFrame as _TTSUpdate
+
+            if stats.preview_restore:  # a cut-off preview may have dropped the switch back
+                await llm.push_frame(_TTSUpdate(delta=voice_settings_delta(args, stats.voice)))
+            full = (full_resp or message.content or "").strip()
             if full and stats.last_barge and stats.response_speech_start:
                 # What you'd heard when you started talking: VAD confirms ~0.2 s late, playback reaches you late.
                 heard = stats.last_barge - 0.2 - args.output_latency - stats.response_speech_start
@@ -1078,6 +1936,7 @@ async def main(args: argparse.Namespace) -> None:
             if message.content:
                 stats.transcript.append(("passe", message.content, "…"))
             return
+        stats.preview_restore = False
         if message.content:
             stats.transcript.append(("passe", message.content))
 
@@ -1085,6 +1944,8 @@ async def main(args: argparse.Namespace) -> None:
 
     @latency.event_handler("on_latency_breakdown")
     async def _breakdown(_obs, b):
+        ev("latency", total=round(b.total_secs, 3), end_of_turn=b.user_turn_secs,
+           ttfb={m.processor: round(m.duration_secs, 3) for m in b.ttfb})
         tr = stats.turn()
         tr.total_s = b.total_secs
         tr.end_of_turn_s = b.user_turn_secs
@@ -1092,8 +1953,53 @@ async def main(args: argparse.Namespace) -> None:
     from pipecat.audio.volume import AudioVolumeTracker
 
     mic_tracker = AudioVolumeTracker()
+    vad_tracker = AudioVolumeTracker()
+
+    from pipecat.frames.frames import (
+        ErrorFrame as _Err,
+        FunctionCallInProgressFrame as _FnStart,
+        InterruptionFrame as _Interrupt,
+        LLMFullResponseEndFrame as _LLMEnd,
+        TTSSpeakFrame as _Speak,
+        TTSTextFrame as _TTSText,
+    )
 
     class Monitor(BaseObserver):
+        def _log(self, f):
+            if _LOG is None:
+                return
+            if isinstance(f, VADUserStartedSpeakingFrame):
+                ev("vad_start", bot_speaking=stats._bot_speaking, mic_volume=round(float(stats.mic_volume), 3),
+                   dbfs=round(float(stats.mic_dbfs), 1), session_active=stats.session_active)
+            elif isinstance(f, _VADStopped):
+                ev("vad_stop")
+            elif isinstance(f, UserStartedSpeakingFrame):
+                ev("user_start")
+            elif isinstance(f, UserStoppedSpeakingFrame):
+                ev("user_stop")
+            elif isinstance(f, _Interrupt):
+                ev("interruption", bot_speaking=stats._bot_speaking)
+            elif isinstance(f, _Transcription):
+                ev("transcript", text=f.text)
+            elif isinstance(f, LLMFullResponseStartFrame):
+                msgs = context.get_messages()
+                last_user = next((m.get("content") for m in reversed(msgs) if m.get("role") == "user"), None)
+                ev("llm_start", messages=len(msgs), last_user=last_user)
+            elif isinstance(f, _LLMEnd):
+                ev("llm_end", text=stats.response_full)
+            elif isinstance(f, _Speak):
+                ev("tts_speak", text=f.text)
+            elif isinstance(f, _TTSText):
+                ev("tts_text", text=f.text)
+            elif isinstance(f, BotStartedSpeakingFrame):
+                ev("bot_start")
+            elif isinstance(f, BotStoppedSpeakingFrame):
+                ev("bot_stop")
+            elif isinstance(f, _FnStart):
+                ev("function_call", name=f.function_name)
+            elif isinstance(f, _Err):
+                ev("error", error=str(f.error)[:500])
+
         async def on_push_frame(self, data: FramePushed):
             if not data.first_push:
                 return
@@ -1102,10 +2008,15 @@ async def main(args: argparse.Namespace) -> None:
                 x = np.frombuffer(f.audio, np.int16).astype(np.float32)
                 rms = float(np.sqrt((x**2).mean())) if len(x) else 0.0
                 stats.mic_dbfs = 20 * np.log10(max(rms, 1.0) / 32768)
-                mic_tracker.update(f.audio, f.sample_rate)
-                stats.mic_volume = mic_tracker.volume
+                if vad_denoise is None:
+                    mic_tracker.update(f.audio, f.sample_rate)
+                    stats.mic_volume = mic_tracker.volume
                 return
             now = time.monotonic()
+            if data.direction == _Dir.DOWNSTREAM or not isinstance(
+                    f, (VADUserStartedSpeakingFrame, _VADStopped, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+                        _Interrupt, BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+                self._log(f)  # broadcast frames travel both ways; log each once
             if isinstance(f, VADUserStartedSpeakingFrame) and stats._bot_speaking and stats._barge_t is None:
                 stats._barge_t = now
                 stats.last_barge = now
@@ -1120,6 +2031,15 @@ async def main(args: argparse.Namespace) -> None:
                 stats.live_bot = ""
                 stats.response_full = ""
                 stats.response_speech_start = None
+                stats.resp_audio_secs = 0.0
+            elif isinstance(f, TTSAudioRawFrame):
+                secs = len(f.audio) / 2 / f.sample_rate
+                stats.resp_audio_secs += secs
+                stats.tts_audio_total += secs
+                if stats.tts_audio_total > 3 and stats.tts_text_chars:
+                    stats.tts_cps = stats.tts_text_chars / stats.tts_audio_total
+            elif isinstance(f, _TTSText):
+                stats.tts_text_chars += len(f.text) + 1
             elif isinstance(f, LLMTextFrame):
                 stats.live_bot = (stats.live_bot + f.text)[-300:]
                 stats.response_full += f.text
@@ -1165,8 +2085,9 @@ async def main(args: argparse.Namespace) -> None:
                 stats.tts_chars += d.value
 
     pipeline = Pipeline(
-        [transport.input(), stt, *([voice_lock] if voice_lock else []), user_agg, llm, tts, transport.output(),
-         assistant_agg]
+        [transport.input(), stt, live_partials, *([voice_lock] if voice_lock else []), session_gate,
+         *([vad_denoise] if vad_denoise else []),
+         user_agg, llm, tts, transport.output(), assistant_agg]
     )
     worker = PipelineWorker(
         pipeline,
@@ -1200,13 +2121,17 @@ async def main(args: argparse.Namespace) -> None:
                     ui.cancel()
     finally:
         hw.cancel()
-        if stats.recording_since:
-            import subprocess
+        if args.tts == "orpheus":
+            if args.keep_orpheus:
+                print("Orpheus server left running (~11 GB VRAM). Stop it: pkill -f 'vllm serve unsloth/orpheus'")
+            else:
+                import orpheus_tts
 
-            subprocess.run(["omarchy", "capture", "screenrecording", "--stop-recording"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("Stopped the screen recording that was still running (saved to ~/Videos).")
+                orpheus_tts.stop_server(stats.server_proc)
+                print("Stopped the Orpheus server.")
         print_summary(stats, args)
+        if _LOG is not None:
+            print(f"Event log: {_LOG.path}  (analyze: uv run spike.py --analyze)")
 
 
 if __name__ == "__main__":
@@ -1220,6 +2145,15 @@ if __name__ == "__main__":
         sys.exit(0)
     if a.calibrate:
         calibrate(a)
+        sys.exit(0)
+    if a.audition:
+        audition(a)
+        sys.exit(0)
+    if a.audition_tics:
+        audition_tics(a)
+        sys.exit(0)
+    if a.analyze:
+        analyze(a.analyze)
         sys.exit(0)
     try:
         asyncio.run(main(a))
