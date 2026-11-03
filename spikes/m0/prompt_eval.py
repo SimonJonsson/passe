@@ -20,6 +20,8 @@ import spike
 # user request (regex on what the user said) → tools that should be called in that turn
 EXPECTED = [
     ("copy request", re.compile(r"\b(copy|clipboard)\b", re.I), {"copy_to_clipboard"}),
+    ("send request", re.compile(r"\b(send|submit)\b.{0,30}\b(it|session|claude|agent|that)\b", re.I),
+     {"send_to_session"}),
     ("revert request", re.compile(r"\b(go back|undo|previous version)\b", re.I), {"revert_draft"}),
     ("voice request", re.compile(r"^\W*((ok(ay)?|yeah|so|please)\W+)*(switch|change|use|try|let me hear|can i hear)"
                                  r"\b.{0,25}\bvoices?\b", re.I),
@@ -98,6 +100,12 @@ def tool_accuracy(s: dict) -> dict:
             landed = next((x["t"] for x in evs[i + 1:] if x["kind"] == "draft"), None)
             if landed is None or landed > claims[0]["t"]:
                 errors.append(f"said the draft was updated before it was (after: {said!r})")
+        send_claims = [x for x in evs[i + 1:nxt] if x["kind"] == "assistant_turn" and re.search(
+            r"\b(sending|sent) (it|the (prompt|draft))\b|\bi'?ve sent\b|\bsending it now\b",
+            spike.conversational(x.get("full") or "").replace("’", "'"), re.I)]
+        sent_ok = any(x["kind"] == "sent_to_agent" and x.get("ok") for x in evs[i + 1:nxt])
+        if send_claims and not sent_ok:
+            errors.append(f"said it was sending without sending (after: {said!r})")
         if spike.CONTROL_UTTERANCE.search(said) and "update_draft" in names - blocked:
             errors.append(f"drafted from an instruction to Passe: {said!r}")
         if "copy_to_clipboard" in names - blocked and not spike.COPY_REQUEST.search(said):

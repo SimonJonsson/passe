@@ -106,6 +106,20 @@ this Passe conversation's log. Ideas are grounded: Passe checks what the session
 anything, one suggestion at a time. Replay: `uv run sim.py fromsession`, which scored prompt 9.2 ·
 conversation 10 · tools 9.5 on 2026-11-01.
 
+### Sending into the session (herdr)
+
+| Say | What happens |
+|---|---|
+| "send it" / "send it to Claude" | `send_to_session`: the draft is typed into the session's herdr pane and submitted (`herdr agent prompt`; multi-line arrives as one message) |
+| "what's it doing?" | `session_status`: idle / working / blocked plus the end of its screen |
+| (after a send) | Passe follows the agent and says "*<session>* is done" (or "…is waiting for your approval") at the next quiet moment |
+
+Guards in code: it only sends when you said "send"/"submit", or answered yes ("yeah", "sounds good") right after
+Passe asked "Send it?". It won't send to an agent waiting at a dialog, asks first if the agent is mid-task, and
+won't re-send the same version unless you say "again". Sessions map to panes even after Claude Code compacts a
+conversation into a new transcript (matched by title). Verified against a real Claude Code pane, 2026-11-02.
+`sim.py send` uses a fake herdr, so scripted runs never type into your sessions.
+
 ### Honest drafting
 
 The writer takes several seconds (6–27 s in practice), so after `update_draft` Passe says it's *updating*, never

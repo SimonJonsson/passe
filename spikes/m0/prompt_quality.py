@@ -95,7 +95,8 @@ CONVO_RUBRIC = {
     "one_question": "Each reply asks at most one question.",
     "questions": "Asks only when it can't take the next step itself; when it does ask, the question is about the "
                  "problem (an example, where, how to verify), never a menu of preferences. No question at all is fine "
-                 "when acting was the right move.",
+                 "when acting was the right move. Confirming before sending a prompt into the agent ('Send it to X?') "
+                 "is required, not a flaw, unless the user had explicitly said to send.",
     "concise": "Replies are short enough to listen to (about two sentences) unless the user asked for more.",
     "responsive": "Each reply addresses what the user just said; corrections are acknowledged and taken on board.",
     "grounded": "Ideas come from what the user said or what the coding-agent session already has, offered one at a "

@@ -61,11 +61,23 @@ def list_sessions(limit: int = 8, max_age_hours: float = 48) -> list[dict]:
         if path.stem not in found and path.stat().st_mtime > cutoff:
             found[path.stem] = {"id": path.stem, "path": path, "cwd": None, "title": None, "pane": None,
                                 "status": None}
-    sessions = sorted(found.values(), key=lambda s: s["path"].stat().st_mtime, reverse=True)[:limit]
+    sessions = sorted(found.values(), key=lambda s: s["path"].stat().st_mtime, reverse=True)
     for s in sessions:
         s["title"] = s["title"] or _title_from_transcript(s["path"]) or s["id"][:8]
         s["age_min"] = round((time.time() - s["path"].stat().st_mtime) / 60)
-    return sessions
+    # Claude Code continues a long conversation in a new transcript after compaction, while herdr keeps reporting
+    # the old session id. Give the newest transcript with the same title the pane, and drop the stale entry.
+    by_title = {}
+    for s in sessions:
+        key = (s["title"] or "").strip().lower()
+        if key in by_title:
+            newer = by_title[key]
+            if s["pane"] and not newer["pane"]:
+                newer.update(pane=s["pane"], status=s["status"], cwd=newer["cwd"] or s["cwd"])
+            s["stale"] = True
+        else:
+            by_title[key] = s
+    return [s for s in sessions if not s.get("stale")][:limit]
 
 
 def find_session(which: str, exclude_ids: set[str] | None = None) -> dict | None:
@@ -138,8 +150,16 @@ def _llm(system: str, user: str, json_mode: bool) -> str:
     return r.choices[0].message.content or ""
 
 
-def brief(session: dict) -> dict:
-    """Cached per transcript size, so it only refreshes when the session has moved on."""
+_RECENT: dict = {}  # path → (time, brief): an active session grows every second, so exact-size caching never hits
+FRESH_SECS = 180
+
+
+def brief(session: dict, max_age: float = FRESH_SECS) -> dict:
+    """A brief under max_age seconds old is reused even if the session has moved on since (an active agent's
+    transcript changes constantly and a fresh brief takes 5–20 s); call refresh_brief to update it in the background."""
+    recent = _RECENT.get(str(session["path"]))
+    if recent and time.time() - recent[0] < max_age:
+        return recent[1]
     key = (str(session["path"]), session["path"].stat().st_size)
     if key not in _BRIEFS:
         raw = _llm(BRIEF_SYSTEM, transcript_text(session["path"]), json_mode=True)
@@ -149,7 +169,12 @@ def brief(session: dict) -> dict:
             data = {"summary": raw.strip()[:500]}
         data.setdefault("title", session.get("title"))
         _BRIEFS[key] = data
+    _RECENT[str(session["path"])] = (time.time(), _BRIEFS[key])
     return _BRIEFS[key]
+
+
+def refresh_brief(session: dict) -> dict:
+    return brief(session, max_age=0)
 
 
 def brief_text(b: dict) -> str:
@@ -168,3 +193,40 @@ def ask(session: dict, question: str) -> str:
 if __name__ == "__main__":
     for i, s in enumerate(list_sessions(), 1):
         print(f"{i}. {s['title'][:50]:50} {s['age_min']:5}m  {s['pane'] or '':8} {s['id'][:8]}")
+
+
+# ---------------------------------------------------------------------------------------------------------
+# herdr control: status, screen, send. Targets are pane ids that host the agent.
+
+
+def _herdr(*args: str, timeout: float = 10) -> dict:
+    out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=timeout)
+    raw = out.stdout.strip() or out.stderr.strip()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"error": {"message": raw[:300] or f"herdr exited {out.returncode}"}}
+
+
+def agent_status(pane: str) -> str:
+    """idle | working | blocked | done | unknown | gone"""
+    r = _herdr("agent", "get", pane)
+    return (r.get("result") or {}).get("agent", {}).get("agent_status") or "gone"
+
+
+def agent_screen(pane: str, lines: int = 40) -> str:
+    """What's on the agent's screen right now (plain text; herdr prints it rather than JSON)."""
+    out = subprocess.run(["herdr", "agent", "read", pane, "--source", "recent-unwrapped", "--lines", str(lines)],
+                         capture_output=True, text=True, timeout=10).stdout
+    rows = [r.rstrip() for r in out.splitlines()]
+    return "\n".join(r for r in rows if r.strip())[-4000:]
+
+
+def send_prompt(pane: str, text: str) -> dict:
+    """Type the prompt into the agent and submit it (herdr honours bracketed paste, so multi-line is one message).
+    Returns {"ok": True} or {"ok": False, "error": "..."}; herdr refuses agents waiting at an approval dialog."""
+    r = _herdr("agent", "prompt", pane, text, timeout=60)
+    if "error" in r:
+        err = r["error"]
+        return {"ok": False, "error": err.get("code") or err.get("message") or str(err)}
+    return {"ok": True}

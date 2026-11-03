@@ -53,6 +53,11 @@ What you're for:
   Never describe what you're about to do instead of doing it. In the same reply call update_draft with that
   concrete next step as the note. Then refine together; the user steers. You draft prompts; the coding agent
   does the work, so say "we'll have it…", never "I'll fix…".
+- Sending: "send it" / "send it to Claude" means send_to_session, which types the draft into the session and
+  submits it, so the agent starts working. If the user hasn't clearly said to send, ask "Send it to <session>?"
+  first. If it reports the agent is mid-task, ask whether to send anyway. Afterwards you'll announce when it's
+  done; "what's it doing?" means session_status. Never say you're sending or have sent unless you call
+  send_to_session in that same reply and it reports sent.
 - "By the way" questions about the session ("what did it just do?", "why did it pick that?", "explain that
   bit"): call ask_session and pass the answer on in your own words.
 - Ideas are welcome, but grounded: before suggesting anything, check what the session already has
@@ -190,6 +195,10 @@ CONTROL_UTTERANCE = re.compile(
     r"(switch|change|use|try)\b.{0,25}\bvoices?\b|(start|end|new|close)\s+(a\s+)?(new\s+)?session|pause|unpause)",
     re.I)
 COPY_REQUEST = re.compile(r"\b(cop(y|ied)|clipboard|as is|anyway|i'?m done with it)\b", re.I)
+SEND_WORDS = re.compile(r"\b(send|submit|fire (it off|away)|ship it|paste it in)\b", re.I)  # always count
+YES_WORDS = re.compile(r"^\W*(yes|yep|yeah|sure|go ahead|do it|go for it|please|ok(ay)?|perfect|great|"
+                       r"(that|this|it)('s| is| looks| sounds) (good|great|fine|right)|sounds good|looks good)\b",
+                       re.I)  # only counts as an answer to "send it?"
 FORCE_CONSENT = re.compile(r"\b(as is|anyway|just copy|copy it (now|regardless)|that'?s fine|leave it)\b", re.I)
 
 STOP_COMMAND = re.compile(
@@ -253,6 +262,9 @@ class Stats:
     recording_file: str | None = None
     agent_session: dict | None = None  # the coding-agent session Passe can see
     agent_brief: dict | None = None
+    draft_sent_to: str | None = None
+    sent_version: int = 0
+    last_assistant_text: str = ""
     copy_held_back: bool = False
     last_user_text: str = ""
     session_n: int = 1
@@ -602,7 +614,8 @@ def render(stats: Stats, args: argparse.Namespace):
         Panel(tl or Text("(no tool calls yet)", style="dim"), title="tools", border_style="dim", height=prompt_h),
         Panel(draft, title=f"prompt · v{v}" + (" · writing…" if stats.drafting else "")
               + (f" · check {stats.last_check['overall']}/10" if stats.last_check else "")
-              + (" · copied to clipboard ✓" if copied else ""),
+              + (" · copied to clipboard ✓" if copied else "")
+              + (f" · sent to {stats.draft_sent_to} ✓" if stats.draft_sent_to else ""),
               border_style="green" if copied else ("cyan" if v else "dim"), height=prompt_h),
     )
 
@@ -855,7 +868,6 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                 return  # superseded, or the user is talking: they'll hear about it in the next reply
             if stats.state == "listening" and not stats._bot_speaking:
                 await llm.push_frame(TTSSpeakFrame("Draft's updated."))
-                ev("tts_speak", text="Draft's updated.", reason="draft landed")
                 return
 
     async def run_writer(note: str):
@@ -875,6 +887,7 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                 stats.drafting = False
             if out["draft"] and out["draft"] != current:
                 stats.draft_versions.append(out["draft"])
+                stats.draft_sent_to = None  # the sent version is no longer the newest
                 v = len(stats.draft_versions)
                 ev("draft", version=v, text=out["draft"], changed=out["changed"],
                    open_questions=out["open_questions"], secs=round(time.monotonic() - t0, 2))
@@ -1050,6 +1063,14 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
             await done(params, call, {"error": "no coding-agent session attached; offer list_sessions"}, "no session")
             return
         b = await ensure_brief()
+        sess = stats.agent_session
+
+        async def refresh():  # keep it current for next time without making the user wait now
+            import agent_sessions as _a
+
+            stats.agent_brief = await asyncio.to_thread(_a.refresh_brief, sess)
+
+        asyncio.create_task(refresh())
         await done(params, call, {"session": stats.agent_session["title"], **(b or {})},
                    f"brief: {stats.agent_session['title']}")
 
@@ -1136,6 +1157,91 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                                   "size_mb": round(size, 1) if size else None},
                    f"saved {Path(path).name if path else '?'}" + (f" · {size:.1f} MB" if size else ""))
 
+    async def watch_agent(pane: str, title: str):
+        """After a send: follow the agent; when it finishes (or needs approval) say so at the next quiet moment."""
+        import agent_sessions
+
+        seen_working, t0 = False, time.monotonic()
+        while time.monotonic() - t0 < 1800:
+            await asyncio.sleep(3)
+            status = await asyncio.to_thread(agent_sessions.agent_status, pane)
+            if status == "working":
+                seen_working = True
+                continue
+            if status == "gone" or (status in ("idle", "done") and not seen_working and time.monotonic() - t0 > 30):
+                return
+            if (status in ("idle", "done") and seen_working) or status == "blocked":
+                line = f"{title} is done." if status != "blocked" else f"{title} is waiting for your approval."
+                ev("agent_finished", pane=pane, status=status, secs=round(time.monotonic() - t0))
+                while stats.state != "listening" or stats._bot_speaking:  # don't talk over anyone
+                    await asyncio.sleep(0.5)
+                await llm.push_frame(TTSSpeakFrame(line))
+                return
+
+    async def send_to_session(params):
+        """Type the current draft into the attached agent session and submit it."""
+        call = track(params)
+        import agent_sessions
+
+        sess = stats.agent_session
+        said = stats.last_user_text or ""
+        asked = bool(re.search(r"\bsend\b[^.?!]*\?", stats.last_assistant_text or "", re.I))
+        if not (SEND_WORDS.search(said) or (YES_WORDS.search(said) and asked)):
+            ev("guard_blocked", tool="send_to_session", reason="the user didn't say to send",
+               last_user=stats.last_user_text)
+            await done(params, call, {"sent": False, "next": f"ask: send it to {sess['title'] if sess else 'the session'}?"
+                                      " Don't call send_to_session until they say yes."}, "asked first")
+            return
+        if not sess or not sess.get("pane"):
+            await done(params, call, {"sent": False, "error": "the session isn't open in a herdr pane; offer to copy "
+                                      "it to the clipboard instead"}, "no pane")
+            return
+        if writer["task"] is not None and not writer["task"].done():
+            try:
+                await asyncio.wait_for(asyncio.shield(writer["task"]), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+        if not stats.draft_versions:
+            await done(params, call, {"sent": False, "error": "there's no draft yet"}, "no draft")
+            return
+        status = await asyncio.to_thread(agent_sessions.agent_status, sess["pane"])
+        if status == "blocked":
+            await done(params, call, {"sent": False, "error": "the agent is waiting at an approval dialog; the user "
+                                      "should answer it first"}, "agent blocked")
+            return
+        if status == "working" and not params.arguments.get("even_if_busy"):
+            await done(params, call, {"sent": False, "busy": True, "next": "it's mid-task: ask whether to send anyway "
+                                      "(then call again with even_if_busy)"}, "agent busy")
+            return
+        if stats.sent_version == len(stats.draft_versions) and not re.search(r"\bagain\b", said, re.I):
+            await done(params, call, {"sent": False, "note": f"this version already went to {sess['title']}; only "
+                                      "send it again if the user says 'again'"}, "already sent")
+            return
+        text = stats.draft_versions[-1]
+        result = await asyncio.to_thread(agent_sessions.send_prompt, sess["pane"], text)
+        ev("sent_to_agent", pane=sess["pane"], session=sess["id"], title=sess["title"], chars=len(text),
+           ok=result["ok"], error=result.get("error"), version=len(stats.draft_versions))
+        if result["ok"]:
+            stats.draft_sent_to = sess["title"]
+            stats.sent_version = len(stats.draft_versions)
+            asyncio.create_task(watch_agent(sess["pane"], sess["title"]))
+        await done(params, call, {"sent": result["ok"], "to": sess["title"], "error": result.get("error"),
+                                  "note": "it's working on it now; you'll announce when it's done"},
+                   f"sent v{len(stats.draft_versions)} → {sess['title']}" if result["ok"] else f"failed: {result.get('error')}")
+
+    async def session_status(params):
+        call = track(params)
+        import agent_sessions
+
+        sess = stats.agent_session
+        if not sess or not sess.get("pane"):
+            await done(params, call, {"error": "the session isn't open in a herdr pane"}, "no pane")
+            return
+        status = await asyncio.to_thread(agent_sessions.agent_status, sess["pane"])
+        screen = await asyncio.to_thread(agent_sessions.agent_screen, sess["pane"], 30)
+        await done(params, call, {"session": sess["title"], "status": status, "screen_tail": screen[-1500:]},
+                   f"{sess['title']}: {status}")
+
     async def preview_voices(params):
         """Each voice introduces itself, numbered; then the current voice is restored."""
         call = track(params)
@@ -1175,6 +1281,11 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         FunctionSchema("start_screen_recording", "Start recording the full screen with desktop audio (no microphone). "
                        "Only when the user asks to record.", {}, []),
         FunctionSchema("stop_screen_recording", "Stop the screen recording and save it to ~/Videos.", {}, []),
+        FunctionSchema("send_to_session", "Type the current draft into the user's coding-agent session and submit it "
+                       "(the agent starts working). Only after the user says to send it.",
+                       {"even_if_busy": {"type": "boolean"}}, []),
+        FunctionSchema("session_status", "What the coding-agent session is doing right now: idle, working, blocked, "
+                       "and the end of its screen.", {}, []),
         FunctionSchema("set_voice",
                        "Change your speaking voice. Use number to pick from the last preview. Omit both to move to "
                        "the next voice. make_default saves it as the user's main voice for next time.",
@@ -1191,7 +1302,8 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                           ("copy_to_clipboard", copy_to_clipboard), ("session_brief", session_brief),
                           ("ask_session", ask_session), ("list_sessions", list_sessions),
                           ("use_session", use_session), ("start_screen_recording", start_screen_recording),
-                          ("stop_screen_recording", stop_screen_recording)):
+                          ("stop_screen_recording", stop_screen_recording),
+                          ("send_to_session", send_to_session), ("session_status", session_status)):
         llm.register_function(name, handler)
     llm.register_function("set_voice", set_voice)
     llm.register_function("preview_voices", preview_voices)
@@ -1994,6 +2106,8 @@ async def main(args: argparse.Namespace) -> None:
         stats.draft_copied = 0
         stats.draft_note_pending = None
         stats.last_check = None
+        stats.draft_sent_to = None
+        stats.sent_version = 0
         stats.tool_calls.clear()
 
     class SessionGate(_Proc):
@@ -2123,6 +2237,8 @@ async def main(args: argparse.Namespace) -> None:
            est_cut_chars=int(heard_s * stats.tts_cps) if heard_s is not None else None)
         stats.live_bot = ""
         full_resp, stats.response_full = stats.response_full, ""  # a canned line next must not inherit it
+        if full_resp.strip():
+            stats.last_assistant_text = full_resp
         tr = stats.turn()
         tr.bot_text = message.content or ""
         if message.interrupted:

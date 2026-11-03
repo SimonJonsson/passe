@@ -118,6 +118,17 @@ SCENARIOS = {
         ("say", "Copy it as is."),
         ("silence", 8.0),
     ],
+    "send": [  # draft from the session, a decoy that must NOT send, then an explicit send
+        ("silence", 1.0),
+        ("say", "Let's draft a prompt."),
+        ("silence", 16.0),
+        ("say", "Yeah, go with that."),
+        ("silence", 12.0),
+        ("say", "That looks good."),
+        ("silence", 10.0),
+        ("say", "Send it to the session."),
+        ("silence", 18.0),
+    ],
     "prompt": [
         ("silence", 1.0),
         ("say", "Hey, I want a prompt for Claude Code to add retry logic to the uploader."),
@@ -188,6 +199,28 @@ la.LocalAudioInputTransport.start = in_start
 la.LocalAudioOutputTransport.setup = out_setup
 la.LocalAudioOutputTransport.start = out_start
 la.LocalAudioOutputTransport.write_audio_frame = write
+
+# Fake herdr: never send into a real session. Sends land in .sim/sent.txt; the "agent" works ~6 s, then idles.
+import agent_sessions  # noqa: E402
+import time as _time  # noqa: E402
+
+_sent_at: list = []
+
+
+def fake_send(pane, text):
+    (SIM / "sent.txt").write_text(f"pane {pane}\n\n{text}\n")
+    _sent_at.append(_time.monotonic())
+    return {"ok": True}
+
+
+def fake_status(pane):
+    return "working" if _sent_at and _time.monotonic() - _sent_at[-1] < 6 else "idle"
+
+
+agent_sessions.send_prompt = fake_send
+agent_sessions.agent_status = fake_status
+agent_sessions.agent_screen = lambda pane, lines=40: "❯ (fake agent screen)"
+(SIM / "sent.txt").unlink(missing_ok=True)
 
 sys.argv = ["spike.py", "--no-dashboard", "--output-latency", "0", *[a for a in sys.argv[2:]]]
 try:
