@@ -8,7 +8,7 @@ It can also drive the operating system or just chat.
 
 Named after Passepartout, the valet who handles the arrangements so the traveller doesn't have to.
 
-> **Status:** planning. No code yet. Start with [`docs/roadmap.md`](docs/roadmap.md) → M0.
+> **Status:** working prototype in [`spikes/m0`](spikes/m0). **Want to try it?** Follow [spikes/m0/README.md](spikes/m0/README.md): you need a Baseten API key, a microphone and headphones; a GPU is optional.
 
 ## At a glance
 

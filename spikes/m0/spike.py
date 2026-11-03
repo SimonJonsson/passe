@@ -23,10 +23,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def has_nvidia_gpu() -> bool:
+    import shutil
+    import subprocess
+
+    if os.environ.get("CUDA_VISIBLE_DEVICES", None) in ("", "-1"):  # GPU explicitly hidden
+        return False
+    if not shutil.which("nvidia-smi"):
+        return False
+    try:
+        return subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5).stdout.strip() != ""
+    except Exception:
+        return False
+
+
 def _ensure_cuda12_libs() -> None:
     """CTranslate2 needs CUDA 12 cuBLAS/cuDNN; the venv ships them. Re-exec with them on the loader path."""
-    import nvidia.cublas
-    import nvidia.cudnn
+    try:
+        import nvidia.cublas
+        import nvidia.cudnn
+    except ImportError:  # no CUDA wheels (e.g. macOS): nothing to do
+        return
 
     libs = [str(Path(p) / "lib") for m in (nvidia.cublas, nvidia.cudnn) for p in m.__path__]
     current = os.environ.get("LD_LIBRARY_PATH", "")
@@ -47,7 +64,8 @@ What you're for:
 - You can see the user's coding-agent session (Claude Code) through tools: session_brief (summary, key points,
   results, next steps), ask_session (answers any question from its transcript), list_sessions and use_session
   (switch to another one). That's your context: lean on it instead of asking the user to explain.
-- Drafting a prompt ("let's draft a prompt", "what should we tell it next?"): call session_brief, then say the
+- If the user has already said what the prompt should do, work on exactly that: no session brief needed.
+- Open-ended starts ("let's draft a prompt", "what should we tell it next?"): call session_brief, then say the
   actual content in a couple of spoken sentences: where the session stands, the one or two results that matter,
   and the next step you'd suggest ("It just tightened turn-taking and the copy check works. Next I'd have it…").
   Never describe what you're about to do instead of doing it. In the same reply call update_draft with that
@@ -336,8 +354,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--speed", type=float, default=1.15, help="speaking rate (1.0 = Kokoro default, 0.5–2.0)")
     p.add_argument("--output-latency", type=float, default=0.2,
                    help="seconds between playback and your ears (Bluetooth ≈ 0.2) for the interruption estimate")
-    p.add_argument("--tts-device", choices=["cuda", "cpu"], default="cuda", help="where Kokoro runs")
-    p.add_argument("--stt-model", default="deepdml/faster-whisper-large-v3-turbo-ct2")
+    p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                   help="where speech models run (auto: the GPU if there's an NVIDIA card, else the CPU)")
+    p.add_argument("--tts-device", choices=["cuda", "cpu"], default=None, help="where Kokoro runs (default: --device)")
+    p.add_argument("--stt-model", default=None,
+                   help="Whisper model (default: large-v3-turbo on GPU, small.en on CPU)")
     p.add_argument("--vad-stop", type=float, default=0.2, help="VAD stop_secs (smart-turn decides the rest)")
     p.add_argument("--turn-max-wait", type=float, default=1.6,
                    help="longest silence before your turn ends when smart-turn thinks you're mid-sentence")
@@ -372,7 +393,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--audition", action="store_true", help="play each Kokoro female voice through your headphones")
     p.add_argument("--no-dashboard", action="store_true", help="plain Pipecat logs instead of the dashboard")
     args = p.parse_args()
-    args.tts = args.tts or load_prefs().get("tts") or "orpheus"
+    if args.device == "auto":
+        args.device = "cuda" if has_nvidia_gpu() else "cpu"
+    args.tts_device = args.tts_device or args.device
+    args.stt_model = args.stt_model or ("deepdml/faster-whisper-large-v3-turbo-ct2" if args.device == "cuda"
+                                        else "small.en")
+    saved = load_prefs().get("tts")
+    args.tts = args.tts or (saved if saved and not (saved == "orpheus" and args.device == "cpu") else None) or (
+        "orpheus" if args.device == "cuda" else "pocket")  # Orpheus needs a GPU; Pocket TTS is built for CPUs
+    if args.tts == "orpheus" and args.device == "cpu":
+        raise SystemExit("Orpheus needs an NVIDIA GPU. On CPU use --tts pocket (default) or --tts kokoro.")
     args.cloning = args.tts == "pocket" and pocket_cloning_available()
     return args
 
@@ -403,8 +433,15 @@ async def sample_hardware(stats: Stats) -> None:
     import psutil
     import pynvml
 
-    pynvml.nvmlInit()
-    h = pynvml.nvmlDeviceGetHandleByIndex(0)
+    try:
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:  # no NVIDIA GPU: track CPU only
+        me = psutil.Process(os.getpid())
+        me.cpu_percent(None)
+        while True:
+            stats.cpu_pct = me.cpu_percent(None)
+            await asyncio.sleep(0.5)
     me = psutil.Process(os.getpid())
     me.cpu_percent(None)
     pid = os.getpid()
@@ -573,7 +610,7 @@ def render(stats: Stats, args: argparse.Namespace):
             f"session ${stats.cost(args.price_in, args.price_out):.5f} · tts chars {stats.tts_chars:,}",
         ),
         Text.assemble(
-            ("GPU (RTX 5090) · CPU\n", "bold"),
+            (f"{'GPU · CPU' if g else 'CPU (no GPU)'}\n", "bold"),
             f"util {g.get('util', 0):>3}% · avg {avg_util:.0f}% · avg while active {avg_active:.0f}%\n",
             f"VRAM {g.get('vram_mb', 0) / 1024:.1f}/{g.get('vram_total_mb', 0) / 1024:.0f} GB · "
             f"spike {g.get('proc_mb', 0) / 1024:.2f} GB (peak {stats.proc_vram_peak_mb / 1024:.2f})\n",
@@ -826,6 +863,16 @@ def voice_settings_delta(args: argparse.Namespace, voice_name: str):
     return KokoroTTSService.Settings(voice=vid, language=Language.EN_GB if lang == "en-gb" else Language.EN_US)
 
 
+def clipboard_command() -> list[str]:
+    """wl-copy (Wayland), xclip / xsel (X11) or pbcopy (macOS), whichever is installed."""
+    import shutil
+
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"], ["pbcopy"]):
+        if shutil.which(cmd[0]):
+            return cmd
+    return ["false"]  # copy fails cleanly and Passe says so
+
+
 def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
     """Prompt crafting (draft, revert, copy), sessions, and voice tools."""
     from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
@@ -1034,7 +1081,7 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
             await done(params, call, {"ok": False, "error": "there is no draft yet"}, "no draft")
             return
         text = stats.draft_versions[-1]
-        proc = await asyncio.create_subprocess_exec("wl-copy", stdin=asyncio.subprocess.PIPE,
+        proc = await asyncio.create_subprocess_exec(*clipboard_command(), stdin=asyncio.subprocess.PIPE,
                                                     stdout=asyncio.subprocess.DEVNULL,
                                                     stderr=asyncio.subprocess.DEVNULL)
         await proc.communicate(text.encode())
@@ -1298,6 +1345,12 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                        {"voices": {"type": "array", "items": {"type": "string", "enum": list(catalog)}},
                         "count": {"type": "integer", "minimum": 1, "maximum": 8}}, []),
     ]
+    import shutil as _shutil
+
+    optional = {"start_screen_recording": bool(_shutil.which("omarchy")),
+                "stop_screen_recording": bool(_shutil.which("omarchy")),
+                "send_to_session": bool(_shutil.which("herdr")), "session_status": bool(_shutil.which("herdr"))}
+    schemas = [sc for sc in schemas if optional.get(sc.name, True)]
     for name, handler in (("update_draft", update_draft), ("revert_draft", revert_draft),
                           ("copy_to_clipboard", copy_to_clipboard), ("session_brief", session_brief),
                           ("ask_session", ask_session), ("list_sessions", list_sessions),
@@ -1858,7 +1911,8 @@ async def main(args: argparse.Namespace) -> None:
         os.environ["ONNX_PROVIDER"] = "CUDAExecutionProvider"  # kokoro-onnx; skips the TensorRT probe
         import onnxruntime
 
-        onnxruntime.preload_dlls()
+        if hasattr(onnxruntime, "preload_dlls"):
+            onnxruntime.preload_dlls()
     else:
         os.environ["ONNX_PROVIDER"] = "CPUExecutionProvider"
 
@@ -1910,7 +1964,8 @@ async def main(args: argparse.Namespace) -> None:
             import atexit
 
             atexit.register(orpheus_tts.stop_server, stats.server_proc)
-    print(f"Loading models (Whisper on GPU, Kokoro on {args.tts_device}, Silero, smart-turn)…", flush=True)
+    print(f"Loading models on {args.device.upper()} (Whisper {args.stt_model}, {args.tts} voice, Silero, "
+          "smart-turn)…", flush=True)
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
@@ -1922,11 +1977,11 @@ async def main(args: argparse.Namespace) -> None:
         )
     )
     stt = WhisperSTTService(
-        device="cuda",
-        compute_type="float16",
+        device=args.device,
+        compute_type="float16" if args.device == "cuda" else "int8",
         settings=WhisperSTTService.Settings(model=args.stt_model, language=Language.EN),
     )
-    # First CUDA inference takes seconds (kernel loading); do it now, not on your first sentence.
+    # The first inference is slow (kernel loading / allocation); do it now, not on your first sentence.
     if stt._model is not None:
         segs, _ = stt._model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
         list(segs)
@@ -2005,7 +2060,7 @@ async def main(args: argparse.Namespace) -> None:
                 if self._active:
                     self._buf += frame.audio
                     now = time.monotonic()
-                    if not self._busy and now - self._last > 0.5 and len(self._buf) > frame.sample_rate:
+                    if not self._busy and now - self._last > partial_every and len(self._buf) > frame.sample_rate:
                         self._last, self._busy = now, True
                         asyncio.create_task(self._partial(bytes(self._buf)))
                 else:
@@ -2036,6 +2091,7 @@ async def main(args: argparse.Namespace) -> None:
             finally:
                 self._busy = False
 
+    partial_every = 0.5 if args.device == "cuda" else 1.5  # spare the CPU
     live_partials = LivePartials()
 
     vad_denoise = None
@@ -2468,8 +2524,9 @@ async def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    _ensure_cuda12_libs()
     a = parse_args()
+    if a.device == "cuda":
+        _ensure_cuda12_libs()  # may re-exec this process with the CUDA 12 libraries on the loader path
     if a.list_devices:
         list_devices()
         sys.exit(0)

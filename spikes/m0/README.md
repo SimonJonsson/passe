@@ -1,227 +1,183 @@
-# M0 spike: local voice loop
+# Passe: a voice companion for your coding agent
 
-Throwaway proof of concept for turn-taking, interruptions, token use and GPU load (see `docs/roadmap.md` → M0).
+Talk to Passe like a colleague. It helps you shape the next prompt for your coding agent (Claude Code, Codex…),
+explains what your agent session has been doing, copies the prompt to your clipboard, and can even send it straight
+into a Claude Code session. Speech recognition and the voice run on your own machine. The language model runs on
+[Baseten](https://www.baseten.co), which needs an API key (see below).
 
-```
-mic (webcam) → Silero VAD → smart-turn v3 → faster-whisper large-v3-turbo (GPU)
-            → Baseten gpt-oss-120b → Kokoro (GPU) → headphones
-```
+> This is a prototype (the "M0 spike"). It works well enough to use every day, but expect rough edges. Design notes
+> and measurements live in [NOTES.md](NOTES.md).
 
-## Run
+## What you need
+
+| | |
+|---|---|
+| **OS** | Linux (built and tested on Arch / Omarchy, Wayland). macOS should work in CPU mode but is untested. Windows: untested. |
+| **Hardware** | A microphone and **headphones** (there's no echo cancellation, so speakers make Passe hear itself). Any modern CPU works. An NVIDIA GPU is optional and gives a more expressive voice (Orpheus). |
+| **Software** | [uv](https://docs.astral.sh/uv/) (it fetches Python 3.12+ for you), PortAudio, and a clipboard tool (`wl-copy`, `xclip`, `xsel` or `pbcopy`) |
+| **Disk** | ~6 GB for the Python environment and models, plus ~15 GB more if you set up the GPU voice |
+| **Account** | A **Baseten API key**, the one paid part (see below) |
+
+## 1. Get a Baseten API key
+
+Passe's "brain" runs on Baseten's hosted models; nothing else in Passe is paid.
+
+1. Sign up at [baseten.co](https://www.baseten.co) and add a payment method.
+2. Create an API key in your Baseten account settings (API keys). Copy it; it's usually shown only once.
+3. Give it to Passe in **one** of these ways:
+   ```sh
+   # a) a file in your home directory (simplest; Passe reads ~/baseten_apikey by default)
+   printf '%s' 'YOUR_KEY_HERE' > ~/baseten_apikey && chmod 600 ~/baseten_apikey
+
+   # b) an environment variable, e.g. in ~/.bashrc / ~/.zshrc / fish config
+   export BASETEN_API_KEY='YOUR_KEY_HERE'
+
+   # c) a key file somewhere else
+   export BASETEN_API_KEY_FILE=~/secrets/baseten
+   ```
+   Never commit the key, and don't paste it into chats or issues.
+
+**Models it uses** (Baseten "Model APIs", nothing to deploy):
+
+| Model | What for | Price (late 2026, per 1M tokens) |
+|---|---|---|
+| `openai/gpt-oss-120b` | the conversation itself, the quick check before copying | $0.10 in / $0.50 out |
+| `deepseek-ai/DeepSeek-V4.1-Flash` | writing the prompt draft, summarising agent sessions | $0.30 in / $1.20 out |
+
+**What it costs:** a conversation is typically **1–5 cents**. Building and testing every feature of this spike over
+three days came to $0.84 in total. Check your usage on the Baseten dashboard.
+
+**What gets sent to Baseten:** the *text* of what you say (your audio never leaves your machine), Passe's replies,
+the prompt draft, and, if session awareness is on (it is by default when you use Claude Code), excerpts of
+your Claude Code session transcript. Turn that last part off with `--session none`.
+
+## 2. Install
 
 ```sh
-cd spikes/m0
-uv run spike.py                      # chat; Ctrl+C quits and prints a summary
-uv run spike.py --list-devices       # then --input-device N / --output-device N
-uv run spike.py --interrupt words    # 'mhm' no longer interrupts (needs 3+ words; acts after you pause)
-uv run spike.py --reasoning medium   # or --model zai-org/GLM-5.3-Flash --price-in … --price-out …
-uv run spike.py --tts-device cpu     # compare Kokoro on CPU
-uv run spike.py --mic-test           # live mic level + VAD state through the input chain (--seconds N for a log)
-uv run spike.py --denoise none --gain-db 0   # raw mic, no input chain
-uv run spike.py --speed 1.3          # faster voice (default 1.15)
-uv run spike.py --tts orpheus        # default: Orpheus 3B on the GPU, expressive (<laugh>, <sigh>…)
-uv run spike.py --tts pocket         # Kyutai Pocket TTS: CPU, ~50 ms to first audio
-uv run spike.py --audition --tts pocket --audition-voices alba,anna,eve   # hear voices without chatting
-uv run spike.py --calibrate          # quiet / you / background speech → suggested flags
-uv run spike.py --voice-lock         # enroll your voice at start; turns that aren't you are dropped
+# system packages: PortAudio (for the microphone) and a clipboard tool
+sudo pacman -S portaudio wl-clipboard                    # Arch / Omarchy
+sudo apt install portaudio19-dev python3-dev wl-clipboard  # Debian / Ubuntu (use xclip on X11)
+brew install portaudio                                   # macOS (pbcopy is built in)
+
+# uv, if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Passe
+git clone https://github.com/SimonJonsson/passe.git
+cd passe/spikes/m0
+uv sync          # creates .venv and installs everything (a few GB: PyTorch, Whisper, voices…)
 ```
 
-The API key is read from `$BASETEN_API_KEY`, or the file `~/baseten_apikey` (override with `$BASETEN_API_KEY_FILE`).
+## 3. Check your microphone
 
-**Nothing is saved at runtime**: no logs, recordings or transcripts. Disk use is only the venv and model weights in
-`~/.cache/huggingface` (Whisper) and `~/.cache/pipecat/kokoro-onnx`.
+```sh
+uv run spike.py --mic-test --seconds 10
+```
 
-## Mic input chain
+Talk normally while it runs. You should see `speech` rise above 0.5 in the seconds you're talking. If not, see
+[Troubleshooting](#troubleshooting). `uv run spike.py --list-devices` shows your audio devices; pick them with
+`--input-device N` / `--output-device N`.
 
-The webcam mic is quiet and reverberant: speech peaked around volume 0.70–0.76 against the VAD's 0.60 gate, and the
-pipeline never detected a turn. Mic audio now goes through **RNNoise → +12 dB gain** before VAD and STT. Measured
-on 2026-11-01: room noise 0.44 → **0.00**, speech 0.74 → **0.85**, speech detected ~90% of each talking second.
+## 4. Run it
 
-## Voice lock (other people in the room)
+```sh
+uv run spike.py
+```
 
-RNNoise removes noise but keeps *any* speech. `--voice-lock` records ~10 s of your voice at startup (in memory
-only) and checks every transcribed turn against it with a WeSpeaker speaker-embedding model (sherpa-onnx, CPU,
-~30 ms). Turns that aren't you are dropped and shown dimmed as `other`; if they cut Passe off, it resumes.
-Scripted test with two synthetic voices: you matched 0.82–0.88, the other voice 0.41–0.48, so all four
-of their lines were rejected at the 0.60 threshold. `--calibrate` suggests the floor and threshold for your room.
+It picks the best mode for your machine automatically:
 
-## Prompt workflow and sessions
-
-Passe's main job: talk through what you want your coding agent to do, and it shapes a written prompt with
-you (one clarifying question at a time). The **prompt** panel shows the current draft and its version.
-
-| Say | What happens |
-|---|---|
-| "I want a prompt for Claude Code to …" | questions, then `update_draft` (goal, context, constraints, done criteria) |
-| "go back" / "undo that" | `revert_draft` (history is never rewritten) |
-| "copy it" / "copy to clipboard" | `copy_to_clipboard` via `wl-copy` (real) |
-| "stop" / "wait" / "hold on" | handled locally: Passe stays quiet, nothing reaches the LLM, the session continues |
-| "end session" / "close session" | handled locally (the model can't end sessions); canned goodbye, then idle |
-| "start session" / "new session" | instant local greeting; conversation, transcript and draft start fresh |
-
-Turn-taking: your turn ends only when smart-turn thinks you're done **and** you've been quiet for
-`--turn-grace` seconds (default 0.7), so a pause between sentences doesn't get answered early.
-
-## Prompt quality
-
-- **Talker vs writer.** The fast talker (gpt-oss-120b) only converses: one diagnostic question at a time, no
-  invented requirements. A background writer (DeepSeek-V4.1-Flash, `prompt_quality.DRAFTER`, `--drafter-model`)
-  rewrites the draft from the whole conversation after every user turn: only what you said or confirmed,
-  corrections applied, unknowns as *Open questions*. Instructions to Passe ("copy it", "go back", "switch
-  voices"…) never feed the draft.
-- **Check before copying.** "Copy it" runs a quick rubric check: invented or stale content is removed
-  automatically. Only real gaps are put to you ("fill them in, or copy it as is?"); `--copy-bar` sets the score
-  below which it asks.
-- **Guards in code.** `update_draft` is ignored after a command, `copy_to_clipboard` only runs if you asked to
-  copy, and skipping the check needs an explicit "as is" / "anyway".
-
-`uv run prompt_eval.py latest|all|FILE…` scores sessions on **prompt** (faithful, goal, context, constraints,
-verifiable, open questions), **conversation** (one question, diagnostic, concise, responsive, no invention,
-flow) and **tools** (requests acted on; errors; attempts caught by guards). `uv run sim.py voice|observability`
-replays two of your real sessions for before/after comparisons.
-
-| 2026-11-01 | prompt | conversation | tools |
-|---|---|---|---|
-| your sessions, old setup | 6.8 | 7.4 | 7.7 |
-| same conversations replayed, new setup | **8.6** | **9.4** | **10.0** |
-
-Writer model comparison (same conversations, same judge): gpt-oss medium 7.0 overall / 3.8 faithful,
-gpt-oss high 8.1 / 5.8, GLM-5.3 8.9 / 9.5 (11.5 s), DeepSeek-V4.1-Flash 8.9 / 9.5 (4 s, shortest drafts).
-
-## Session awareness (/btw)
-
-Passe sees your coding-agent session: by default the most recently active Claude Code session
-(`--session latest|<id prefix>|<title word>|none`). `agent_sessions.py` lists sessions (herdr pane titles where
-available; `uv run agent_sessions.py`), reads Claude Code transcripts and has a background model brief them
-(summary, key points, results, open problems, next steps; cached until the session moves on).
-
-| Say | What happens |
-|---|---|
-| "let's draft a prompt" | `session_brief` → Passe says where the session stands and suggests the next step → drafting starts |
-| "what did it just do?", "why did it pick that?" | `ask_session`, answered from the transcript |
-| "which sessions are there?" / "use the trading one" | `list_sessions` / `use_session` |
-
-The writer grounds drafts in the brief, and every draft opens with a **Read first** line pointing the agent at
-this Passe conversation's log. Ideas are grounded: Passe checks what the session already has before suggesting
-anything, one suggestion at a time. Replay: `uv run sim.py fromsession`, which scored prompt 9.2 ·
-conversation 10 · tools 9.5 on 2026-11-01.
-
-### Sending into the session (herdr)
-
-| Say | What happens |
-|---|---|
-| "send it" / "send it to Claude" | `send_to_session`: the draft is typed into the session's herdr pane and submitted (`herdr agent prompt`; multi-line arrives as one message) |
-| "what's it doing?" | `session_status`: idle / working / blocked plus the end of its screen |
-| (after a send) | Passe follows the agent and says "*<session>* is done" (or "…is waiting for your approval") at the next quiet moment |
-
-Guards in code: it only sends when you said "send"/"submit", or answered yes ("yeah", "sounds good") right after
-Passe asked "Send it?". It won't send to an agent waiting at a dialog, asks first if the agent is mid-task, and
-won't re-send the same version unless you say "again". Sessions map to panes even after Claude Code compacts a
-conversation into a new transcript (matched by title). Verified against a real Claude Code pane, 2026-11-02.
-`sim.py send` uses a fake herdr, so scripted runs never type into your sessions.
-
-### Honest drafting
-
-The writer takes several seconds (6–27 s in practice), so after `update_draft` Passe says it's *updating*, never
-that it's done. When a draft you asked for lands, it says "Draft's updated." at the next quiet moment, or not at
-all if you're already talking. The scorecard flags "said the draft was updated before it was".
-
-### Screen recording
-
-"Record my screen" / "stop recording": the full screen plus **desktop audio** (Passe's voice, anything playing),
-no microphone: what you say is already in the transcript and the event log. Saved to `~/Videos`; ● REC shows
-in the header, and it stops cleanly if Passe exits.
-
-## Observability
-
-Every run writes an event log to `~/.local/state/passe/spike-<time>.jsonl` (`--no-log` to disable): speech
-starts/stops with mic level, partial and final transcripts, barge-ins, LLM requests and replies, tool calls,
-TTS lines, sessions, latency and warnings/errors.
-
-    uv run spike.py --analyze           # timeline + diagnosis of the latest run
-    uv run spike.py --analyze FILE
-
-The diagnosis splits barge-ins into real ones, stop commands and ones with no words (noise, coughs, other
-voices), lists what ended each session, and summarises latency per stage.
-
-`uv run sim.py stop|prompt` replays a scripted conversation with synthesized speech (no mic, silent output,
-fake clipboard, logs in `.sim/`) and prints the analysis.
-
-## Orpheus (default voice engine)
-
-Orpheus 3B speaks in SNAC audio codes; a local vLLM server (separate `.venv-vllm`) generates them and
-`orpheus_tts.py` decodes them on the GPU. Female voices only: tara, leah, jess, mia, zoe. Passe may
-use one emotion tag per reply (`<laugh>`, `<chuckle>`, `<sigh>`, `<gasp>`, `<groan>`, `<yawn>`).
-
-Measured 2026-11-01: ~155 ms to first audio warm, 2.3× realtime, ~11.5 GB VRAM total. The first server start
-takes ~5 min (6.6 GB download + compile). The server is left running between spike runs; stop it with
-`pkill -f 'vllm serve unsloth/orpheus'` or run with `--stop-orpheus`.
-
-Setup: `uv venv --python 3.12 .venv-vllm && VIRTUAL_ENV=.venv-vllm uv pip install vllm`
-
-The dashboard shows what you're saying as you say it (Whisper re-transcribes the utterance every ~0.5 s)
-and, while Passe talks, how far it has got through its reply, with a progress bar.
-
-Other tools are voice-only (`preview_voices`, `set_voice`). The earlier dummy tools (git, tests, screen recording,
-draft) are in git history at d8364bc.
-
-### Style: warm (default)
-
-`--style warm` (the default; `--style natural` for the plain persona) makes Passe low, warm, unhurried and a
-little teasing, with signature tics (`<sigh>`, `<chuckle>`, "Oh…", "Well…", "There we go."). It also adds warm,
-zero-latency post-processing (low shelf, softer highs, gentle compression). Spelled-out hums ("mm", "mhm", "hmm")
-sound robotic in Orpheus, so the model is told not to write them, and a filter maps any that slip through to
-`<sigh>`, "Yeah," or "Well…". Hear the tics with `uv run spike.py --audition-tics`. Pitch shifting (`--pitch`)
-is audition-only for now, because streaming it adds ~1 s of delay.
-
-### Consistent delivery
-
-Orpheus samples every request independently, so synthesizing sentence by sentence made Tara drift in pitch,
-energy and pace within one reply. By default the spike now sends Orpheus a whole reply (split into ~400-char
-paragraphs for long ones). `uv run consistency_eval.py` measures it, here with 3 renderings of a five-sentence reply:
-
-| Configuration | Voice identity ↑ | Pitch drift ↓ | Loudness drift ↓ |
-|---|---|---|---|
-| per sentence (before) | 0.561 | 33.3 Hz | 3.3 dB |
-| per sentence, lower temperature | 0.566 | 28.6 Hz | 3.1 dB |
-| **whole reply (now)** | **0.600** | **18.3 Hz** | **1.9 dB** |
-
-Orpheus gets an audio-token budget proportional to the text (a fixed 1600 cut long replies off at 19.5 s), and the server runs with an 8k context. Cost: Passe waits for the LLM to finish the reply before speaking, about +250–350 ms per turn in the scripted
-runs. `--tts-chunk sentence` switches back.
-
-## Voice library
-
-Say "let me hear some voices": each voice introduces itself, numbered, then Passe switches back. Say
-"number two, make it my main voice" and it's saved to `~/.config/passe/spike-voice.json` (the only
-setting the spike persists), so the next `uv run spike.py` starts with that engine and voice.
-
-Your own clips: put a few seconds of clean speech as `~/.config/passe/voices/<name>.wav` and Pocket TTS clones it
-into a selectable voice. Cloning needs Kyutai's gated weights: accept the terms on the `kyutai/pocket-tts`
-Hugging Face page and run `uvx hf auth login` once. Until then, the clips are skipped.
-
-## Reading the dashboard
-
-| Column | Meaning |
-|---|---|
-| total | You stop talking → Passe starts speaking (pipeline side) |
-| end-of-turn | VAD silence + smart-turn decision + STT finalisation |
-| stt / llm / tts | Time to first result of each stage |
-| tok in / out / reason | Tokens for that turn (reasoning = hidden thinking tokens) |
-| interrupted | You talked over the reply |
-
-Bluetooth headphones add roughly 150–250 ms of output latency on top of everything shown.
-
-## Scripted run (synthesized speech in, silent output), 2026-11-01
-
-| Metric | Kokoro on CPU | Kokoro on GPU |
+| | CPU (no NVIDIA GPU) | NVIDIA GPU |
 |---|---|---|
-| Median turn (stop talking → reply starts) | 935 ms | **686 ms** |
-| p90 turn | 3,386 ms | **959 ms** |
-| End of turn / STT / LLM first token | ~260 / ~260 / ~210–270 ms | same |
-| TTS first audio | 290–2,330 ms | **44–144 ms** |
-| Spike VRAM | 2.5 GB | 5.0 GB |
-| GPU utilisation (avg) | ~0% | ~2% |
-| Cost of a 4-turn conversation | $0.0004 | $0.0004 |
+| Speech recognition | Whisper `small.en` | Whisper `large-v3-turbo` |
+| Voice | **Pocket TTS**: natural female voices, made for CPUs | **Orpheus**: very expressive, can laugh and sigh (needs the extra setup below) |
+| Typical reply delay | ~1.5–3 s on a fast CPU, more on older ones | ~1–1.7 s |
 
-Setup notes: CTranslate2 needs CUDA 12 cuBLAS/cuDNN (pip wheels in the venv; the script re-execs with
-`LD_LIBRARY_PATH` set). Kokoro on GPU uses `onnxruntime-gpu`, installed alongside `onnxruntime`.
+The first start downloads models (a few minutes). A dashboard opens with the conversation, the prompt draft,
+tool activity and latency. **Ctrl+C quits.**
+
+## Things to say
+
+| Say | What happens |
+|---|---|
+| "I want a prompt for Claude Code to …" | Passe asks what's missing, one question at a time, and writes the draft in the **prompt** panel |
+| "Let's draft a prompt." / "What should we tell it next?" | Passe reads your Claude Code session, says where it stands, suggests a next step and drafts it |
+| "What did it just do?" / "Why did it pick that?" | answered from your Claude Code session (by-the-way questions) |
+| "Go back" / "undo that" | previous draft version |
+| "Copy it" | quick quality check, then the prompt is on your clipboard. If it finds gaps it asks; "copy it as is" skips them |
+| "Send it to the session" | types the prompt into your Claude Code session and submits it (needs herdr, see below) |
+| "Stop" / "wait" | Passe stops talking; nothing is sent to the model |
+| "Pause" … "unpause" | Passe ignores everything until you unpause (no tokens spent) |
+| "End session" / "start session" | close the conversation / start fresh with an empty draft |
+| "Let me hear some voices" / "number two, make it my main voice" | voice samples; pick one and it's remembered |
+
+Talk naturally; you can interrupt Passe at any time.
+
+## Useful options
+
+| Option | What it does |
+|---|---|
+| `--device cpu` / `--device cuda` | force CPU or GPU mode (default: automatic) |
+| `--tts pocket \| kokoro \| orpheus` | voice engine (Orpheus needs a GPU) |
+| `--voice NAME` | starting voice, e.g. `--voice eve` (try `--audition` to hear them all) |
+| `--style natural` | plain persona instead of the default warm, teasing "warm" style |
+| `--session none` | don't read any Claude Code session (nothing from it is sent to Baseten) |
+| `--session NAME` | attach a specific session by title word or id (default: the most recently active) |
+| `--turn-grace 0.8` | wait longer before answering if Passe keeps cutting you off (default 0.5 s) |
+| `--min-volume 0.5` | for quiet microphones |
+| `--voice-lock` | learns your voice at start and ignores other people in the room (`--calibrate` helps tune it) |
+| `--no-log` | don't write the event log |
+
+## Optional extras
+
+**Claude Code session awareness:** automatic if you use [Claude Code](https://claude.com/claude-code): Passe reads
+your most recently active session from `~/.claude/projects/`. Read-only.
+
+**Sending prompts into Claude Code:** install [herdr](https://github.com/omacom-io/herdr) and run your Claude Code sessions in herdr
+panes. Then "send it" types the prompt into the session and Passe tells you when the agent is done. Without herdr,
+use "copy it" and paste.
+
+**Screen recording:** on [Omarchy](https://github.com/basecamp/omarchy), "record my screen" / "stop recording" records the screen
+with desktop audio (no microphone) to `~/Videos`.
+
+**GPU voice (Orpheus):** with an NVIDIA GPU (~12 GB free VRAM):
+```sh
+uv venv --python 3.12 .venv-vllm && VIRTUAL_ENV=.venv-vllm uv pip install vllm   # ~8 GB, separate on purpose
+uv run spike.py --tts orpheus     # first start downloads ~6.6 GB and takes ~5 min; later ~30 s
+```
+The Orpheus server starts and stops with Passe.
+
+## Troubleshooting
+
+| Problem | Try |
+|---|---|
+| It doesn't react to me | `uv run spike.py --mic-test`. If "voice" goes up but "filtered" stays low, use `--min-volume 0.5`, or raise your mic level (`wpctl set-volume @DEFAULT_SOURCE@ 100%` on PipeWire) |
+| It mishears words | a closer microphone helps most (webcam mics pick up a lot of room echo) |
+| It answers before I've finished | `--turn-grace 0.8` |
+| It hears other people / the TV | `--voice-lock` (run `--calibrate` first) |
+| Replies feel slow on CPU | expected on older CPUs. `--tts kokoro` is lighter but sounds flatter |
+| `pyaudio` fails to install | install PortAudio first (see Install) |
+| "copy it" fails | install a clipboard tool: `wl-clipboard` (Wayland), `xclip` (X11) |
+| "Orpheus needs an NVIDIA GPU" | you're on CPU: just use the default (`--tts pocket`) |
+| Bluetooth headphones feel laggy | Bluetooth adds ~0.2 s; wired is snappier |
+
+## Logs and privacy
+
+- **Event log:** every run writes a text log (what was heard, replies, drafts, tool calls, timings) to
+  `~/.local/state/passe/spike-<time>.jsonl`. No audio is ever saved. `uv run spike.py --analyze` turns the
+  latest log into a readable timeline. `--no-log` turns it off.
+- **Settings:** your chosen main voice is saved in `~/.config/passe/spike-voice.json`.
+- **Sent to Baseten:** see [the API key section](#1-get-a-baseten-api-key).
+
+## For developers
+
+| Tool | What it does |
+|---|---|
+| `uv run spike.py --analyze [LOG]` | timeline and diagnosis of a session |
+| `uv run prompt_eval.py latest` | scores a session: prompt quality, conversation quality, tool-calling accuracy |
+| `uv run sim.py prompt\|voice\|observability\|fromsession\|send\|stop\|pause` | replays a scripted conversation with synthesized speech (no mic, fake clipboard and herdr) |
+| `uv run stt_eval.py` | compares speech-recognition setups on your own voice |
+| `uv run consistency_eval.py` | measures how consistent the GPU voice is across a reply |
+| `uv run tone_shift.py latest` | finds tone shifts in Passe's replies |
+| `uv run agent_sessions.py` | lists the Claude Code sessions Passe can see |
+
+How it's built, and why: [NOTES.md](NOTES.md).

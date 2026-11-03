@@ -24,7 +24,9 @@ os.environ["PATH"] = f"{SIM / 'bin'}:{os.environ['PATH']}"
 sys.path.insert(0, str(HERE))
 import spike  # noqa: E402
 
-spike._ensure_cuda12_libs()
+if "--device" not in sys.argv or "cuda" in sys.argv:
+    if spike.has_nvidia_gpu():
+        spike._ensure_cuda12_libs()
 spike.LOG_DIR = SIM / "logs"
 spike.PREFS_FILE = SIM / "prefs.json"
 
