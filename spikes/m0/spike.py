@@ -349,7 +349,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep-orpheus", action="store_true",
                    help="leave the Orpheus server running on exit (default: it stops with the spike)")
     p.add_argument("--voice", default=None, help="starting voice (catalog name or engine voice id)")
-    p.add_argument("--audition-tics", action="store_true", help="hear warm Tara's tics, numbered")
+    p.add_argument("--audition-tics", action="store_true", help="hear Tara's tics in the warm style, numbered")
     p.add_argument("--audition-voices", default=None, help="with --audition: comma-separated subset")
     p.add_argument("--speed", type=float, default=1.15, help="speaking rate (1.0 = Kokoro default, 0.5–2.0)")
     p.add_argument("--output-latency", type=float, default=0.2,
@@ -1658,8 +1658,7 @@ AUDITION_LINE_ORPHEUS = (
 
 
 AUDITION_LINE_WARM = (
-    "Mm… there you are. <chuckle> I was starting to think you'd forgotten about me. So… what are we building "
-    "tonight?"
+    "Oh… there you are. <chuckle> Ready when you are. So… what are we building today?"
 )
 
 
@@ -1676,7 +1675,7 @@ TIC_LINES = [
 
 
 def audition_tics(args: argparse.Namespace) -> None:
-    """Warm Tara says each tic, numbered, so you can tell which ones sound natural."""
+    """Tara says each tic in the warm style, numbered, so you can tell which ones sound natural."""
     import numpy as np
     import pyaudio
 

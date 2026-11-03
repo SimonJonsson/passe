@@ -119,7 +119,7 @@ Talk naturally; you can interrupt Passe at any time.
 | `--device cpu` / `--device cuda` | force CPU or GPU mode (default: automatic) |
 | `--tts pocket \| kokoro \| orpheus` | voice engine (Orpheus needs a GPU) |
 | `--voice NAME` | starting voice, e.g. `--voice eve` (try `--audition` to hear them all) |
-| `--style natural` | plain persona instead of the default warm, teasing "warm" style |
+| `--style natural` | plain persona instead of the default warm, playful style |
 | `--session none` | don't read any Claude Code session (nothing from it is sent to Baseten) |
 | `--session NAME` | attach a specific session by title word or id (default: the most recently active) |
 | `--turn-grace 0.8` | wait longer before answering if Passe keeps cutting you off (default 0.5 s) |
