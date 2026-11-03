@@ -229,3 +229,15 @@ Bluetooth headphones add roughly 150–250 ms of output latency on top of everyt
 
 Setup notes: CTranslate2 needs CUDA 12 cuBLAS/cuDNN (pip wheels in the venv; the script re-execs with
 `LD_LIBRARY_PATH` set). Kokoro on GPU uses `onnxruntime-gpu`, installed alongside `onnxruntime`.
+
+## Conversational drafts (2026-11-03)
+
+Drafts used to be structured markdown (Goal / Context / Requirements / Done when / Open questions). On request,
+the writer now produces a conversational summary: a *Read first* line, two to four short paragraphs of prose (the
+situation with concrete details, what we want, how we'll know it's done), and a short open-questions line.
+The fromsession replay scored prompt 9.8 · conversation 9.3 · tools 10 in this format.
+
+Send-to-session fixes from a live session: "Confirm." and "sent to…" are accepted as consent; sends can carry dictated
+text; sessions named by voice are matched loosely ("scalping" finds "scalp") and `send_to_session(session=…)`
+switches first; refused sends no longer retry in a loop; "stop session" ends the session. Orpheus moved to port
+18100 (`PASSE_ORPHEUS_PORT` overrides) because another project held 8100.

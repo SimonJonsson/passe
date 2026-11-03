@@ -105,9 +105,11 @@ tool activity and latency. **Ctrl+C quits.**
 | "Go back" / "undo that" | previous draft version |
 | "Copy it" | quick quality check, then the prompt is on your clipboard. If it finds gaps it asks; "copy it as is" skips them |
 | "Send it to the session" | types the prompt into your Claude Code session and submits it (needs herdr, see below) |
+| "Send 'run the tests' to scalp" | sends exactly what you dictated, to the session you named |
+| "Find the scalping conversation" / "use the trading one" | switches to another session; names are matched loosely |
 | "Stop" / "wait" | Passe stops talking; nothing is sent to the model |
 | "Pause" … "unpause" | Passe ignores everything until you unpause (no tokens spent) |
-| "End session" / "start session" | close the conversation / start fresh with an empty draft |
+| "End session" (or "stop session") / "start session" | close the conversation / start fresh with an empty draft |
 | "Let me hear some voices" / "number two, make it my main voice" | voice samples; pick one and it's remembered |
 
 Talk naturally; you can interrupt Passe at any time.
@@ -158,6 +160,7 @@ The Orpheus server starts and stops with Passe.
 | `pyaudio` fails to install | install PortAudio first (see Install) |
 | "copy it" fails | install a clipboard tool: `wl-clipboard` (Wayland), `xclip` (X11) |
 | "Orpheus needs an NVIDIA GPU" | you're on CPU: just use the default (`--tts pocket`) |
+| "Orpheus server exited: Address already in use" | another program uses Orpheus's port (18100): `PASSE_ORPHEUS_PORT=18200 uv run spike.py` |
 | Bluetooth headphones feel laggy | Bluetooth adds ~0.2 s; wired is snappier |
 
 ## Logs and privacy

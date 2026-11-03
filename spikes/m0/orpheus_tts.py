@@ -27,7 +27,7 @@ from pipecat.transcriptions.language import Language
 ORPHEUS_MODEL = "unsloth/orpheus-3b-0.1-ft"  # public mirror of canopylabs/orpheus-3b-0.1-ft
 FEMALE_VOICES = ["tara", "leah", "jess", "mia", "zoe"]
 EMOTION_TAGS = ["<laugh>", "<chuckle>", "<sigh>", "<cough>", "<sniffle>", "<groan>", "<yawn>", "<gasp>"]
-PORT = 8100
+PORT = int(os.environ.get("PASSE_ORPHEUS_PORT", "18100"))  # away from common dev-server ports (8000–8100)
 BASE_URL = f"http://127.0.0.1:{PORT}/v1"
 
 _START = [128259]  # start of human turn
@@ -50,7 +50,7 @@ def server_up() -> bool:
 
     try:
         with urllib.request.urlopen(f"{BASE_URL}/models", timeout=1) as r:
-            return r.status == 200
+            return r.status == 200 and ORPHEUS_MODEL in r.read().decode(errors="replace")  # really Orpheus
     except OSError:
         return False
 

@@ -87,9 +87,22 @@ def find_session(which: str, exclude_ids: set[str] | None = None) -> dict | None
         return None
     if which in ("latest", ""):
         return sessions[0]
-    w = which.lower()
-    return next((s for s in sessions if s["id"].startswith(w)), None) or next(
-        (s for s in sessions if w in (s["title"] or "").lower()), None)
+    w = which.lower().strip()
+    by_id = next((s for s in sessions if s["id"].startswith(w)), None)
+    if by_id:
+        return by_id
+
+    # Spoken names are loose: "the scalping conversation" should find "scalp", "voice to text session" the
+    # "Voice to text prompt augmentation" one. Score shared word stems (4+ letters, either direction).
+    stop = {"the", "conversation", "session", "chat", "one", "that", "this", "with", "about", "into"}
+    q = [t for t in re.findall(r"[a-z0-9]+", w) if len(t) >= 3 and t not in stop]
+
+    def score(s):
+        title = [t for t in re.findall(r"[a-z0-9]+", (s["title"] or "").lower()) if len(t) >= 3]
+        return sum(1 for a in q for b in title if a.startswith(b[:4]) or b.startswith(a[:4]))
+
+    best = max(sessions, key=score)
+    return best if score(best) > 0 else None
 
 
 def transcript_text(path: Path, max_chars: int = 40000) -> str:

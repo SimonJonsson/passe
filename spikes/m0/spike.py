@@ -71,8 +71,11 @@ What you're for:
   Never describe what you're about to do instead of doing it. In the same reply call update_draft with that
   concrete next step as the note. Then refine together; the user steers. You draft prompts; the coding agent
   does the work, so say "we'll have it…", never "I'll fix…".
+- Sessions by name: "find the scalping conversation", "switch to the trading one" means use_session with that
+  name (not ask_session, which only searches inside the current session).
 - Sending: "send it" / "send it to Claude" means send_to_session, which types the draft into the session and
-  submits it, so the agent starts working. If the user hasn't clearly said to send, ask "Send it to <session>?"
+  submits it, so the agent starts working. A dictated message ("send 'testing testing' to scalp") goes in as
+  text, the named session as session. If the user hasn't clearly said to send, ask "Send it to <session>?"
   first. If it reports the agent is mid-task, ask whether to send anyway. Afterwards you'll announce when it's
   done; "what's it doing?" means session_status. Never say you're sending or have sent unless you call
   send_to_session in that same reply and it reports sent.
@@ -196,7 +199,7 @@ _LEAD = r"^\s*((ok(ay)?|hey|passe|pass)[\s,]+)*"
 PAUSE = re.compile(_LEAD + r"(pause|mute|go quiet|stop listening)([\s,]+(please|for a (sec(ond)?|moment|bit)))*[\s.!,]*$",
                    re.I)
 RESUME = re.compile(_LEAD + r"(un[\s-]?pause|resume|un[\s-]?mute|i'?m back|start listening|wake up)\b", re.I)
-END_SESSION = re.compile(r"\b(end|close|finish)\b[\w\s]{0,10}\bsession\b", re.I)
+END_SESSION = re.compile(r"\b(end|close|finish|stop)\b[\w\s]{0,10}\bsession\b", re.I)
 _SOUND_TAG = re.compile(r"\s*<(laugh|chuckle|sigh|cough|sniffle|groan|yawn|gasp)>\s*", re.I)
 
 
@@ -213,8 +216,10 @@ CONTROL_UTTERANCE = re.compile(
     r"(switch|change|use|try)\b.{0,25}\bvoices?\b|(start|end|new|close)\s+(a\s+)?(new\s+)?session|pause|unpause)",
     re.I)
 COPY_REQUEST = re.compile(r"\b(cop(y|ied)|clipboard|as is|anyway|i'?m done with it)\b", re.I)
-SEND_WORDS = re.compile(r"\b(send|submit|fire (it off|away)|ship it|paste it in)\b", re.I)  # always count
+SEND_WORDS = re.compile(r"\b(send|sent (it|that|this|to)|submit|fire (it off|away)|ship it|paste it in)\b",
+                        re.I)  # always count ("sent to…" is how speech recognition often hears "send to…")
 YES_WORDS = re.compile(r"^\W*(yes|yep|yeah|sure|go ahead|do it|go for it|please|ok(ay)?|perfect|great|"
+                       r"confirm(ed)?|correct|affirmative|right|go|"
                        r"(that|this|it)('s| is| looks| sounds) (good|great|fine|right)|sounds good|looks good)\b",
                        re.I)  # only counts as an answer to "send it?"
 FORCE_CONSENT = re.compile(r"\b(as is|anyway|just copy|copy it (now|regardless)|that'?s fine|leave it)\b", re.I)
@@ -1148,6 +1153,7 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         import agent_sessions
 
         n, name = params.arguments.get("number"), str(params.arguments.get("name") or "")
+        # (find_session matches spoken names loosely: "scalping" finds "scalp")
         choices = getattr(stats, "session_choices", None) or await asyncio.to_thread(agent_sessions.list_sessions)
         pick = choices[int(n) - 1] if n and 1 <= int(n) <= len(choices) else (
             agent_sessions.find_session(name) if name else None)
@@ -1157,7 +1163,9 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         stats.agent_session, stats.agent_brief = pick, None
         ev("agent_session", id=pick["id"], title=pick["title"])
         await ensure_brief()
-        await done(params, call, {"now_using": pick["title"], "summary": (stats.agent_brief or {}).get("summary")},
+        await done(params, call, {"now_using": pick["title"], "summary": (stats.agent_brief or {}).get("summary"),
+                                  "note": "if the user wanted something sent there, call send_to_session now; "
+                                          "never say you're sending without calling it"},
                    f"using {pick['title']}")
 
     async def recording_active() -> bool:
@@ -1230,9 +1238,24 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         call = track(params)
         import agent_sessions
 
+        if call["repeat"] > 2:
+            ev("guard_blocked", tool="send_to_session", reason="repeated within one turn",
+               last_user=stats.last_user_text)
+            await done(params, call, {"error": "already handled this turn. Stop calling tools and reply."}, "loop cut")
+            return
+        target = str(params.arguments.get("session") or "").strip()
+        if target:  # "send it to scalp": switch first
+            found = await asyncio.to_thread(agent_sessions.find_session, target)
+            if found is None:
+                await done(params, call, {"sent": False, "error": f"no session matching {target!r}; offer "
+                                          "list_sessions"}, f"no session {target!r}")
+                return
+            if not stats.agent_session or found["id"] != stats.agent_session["id"]:
+                stats.agent_session, stats.agent_brief = found, None
+                ev("agent_session", id=found["id"], title=found["title"])
         sess = stats.agent_session
         said = stats.last_user_text or ""
-        asked = bool(re.search(r"\bsend\b[^.?!]*\?", stats.last_assistant_text or "", re.I))
+        asked = bool(re.search(r"\b(send|sending)\b[^.?!]*\?", stats.last_assistant_text or "", re.I))
         if not (SEND_WORDS.search(said) or (YES_WORDS.search(said) and asked)):
             ev("guard_blocked", tool="send_to_session", reason="the user didn't say to send",
                last_user=stats.last_user_text)
@@ -1248,8 +1271,10 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                 await asyncio.wait_for(asyncio.shield(writer["task"]), timeout=30)
             except asyncio.TimeoutError:
                 pass
-        if not stats.draft_versions:
-            await done(params, call, {"sent": False, "error": "there's no draft yet"}, "no draft")
+        dictated = str(params.arguments.get("text") or "").strip()  # "send 'testing testing' to it"
+        if not dictated and not stats.draft_versions:
+            await done(params, call, {"sent": False, "error": "there's no draft yet; if the user dictated a message, "
+                                      "pass it as text"}, "no draft")
             return
         status = await asyncio.to_thread(agent_sessions.agent_status, sess["pane"])
         if status == "blocked":
@@ -1260,21 +1285,24 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
             await done(params, call, {"sent": False, "busy": True, "next": "it's mid-task: ask whether to send anyway "
                                       "(then call again with even_if_busy)"}, "agent busy")
             return
-        if stats.sent_version == len(stats.draft_versions) and not re.search(r"\bagain\b", said, re.I):
+        if not dictated and stats.sent_version == len(stats.draft_versions) and not re.search(r"\bagain\b", said,
+                                                                                           re.I):
             await done(params, call, {"sent": False, "note": f"this version already went to {sess['title']}; only "
                                       "send it again if the user says 'again'"}, "already sent")
             return
-        text = stats.draft_versions[-1]
+        text = dictated or stats.draft_versions[-1]
         result = await asyncio.to_thread(agent_sessions.send_prompt, sess["pane"], text)
         ev("sent_to_agent", pane=sess["pane"], session=sess["id"], title=sess["title"], chars=len(text),
            ok=result["ok"], error=result.get("error"), version=len(stats.draft_versions))
-        if result["ok"]:
+        if result["ok"] and not dictated:
             stats.draft_sent_to = sess["title"]
             stats.sent_version = len(stats.draft_versions)
+        if result["ok"]:
             asyncio.create_task(watch_agent(sess["pane"], sess["title"]))
         await done(params, call, {"sent": result["ok"], "to": sess["title"], "error": result.get("error"),
                                   "note": "it's working on it now; you'll announce when it's done"},
-                   f"sent v{len(stats.draft_versions)} → {sess['title']}" if result["ok"] else f"failed: {result.get('error')}")
+                   (f"sent {'message' if dictated else f'v{len(stats.draft_versions)}'} → {sess['title']}"
+                    if result["ok"] else f"failed: {result.get('error')}"))
 
     async def session_status(params):
         call = track(params)
@@ -1328,9 +1356,12 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         FunctionSchema("start_screen_recording", "Start recording the full screen with desktop audio (no microphone). "
                        "Only when the user asks to record.", {}, []),
         FunctionSchema("stop_screen_recording", "Stop the screen recording and save it to ~/Videos.", {}, []),
-        FunctionSchema("send_to_session", "Type the current draft into the user's coding-agent session and submit it "
-                       "(the agent starts working). Only after the user says to send it.",
-                       {"even_if_busy": {"type": "boolean"}}, []),
+        FunctionSchema("send_to_session", "Type the current draft (or a message the user dictated, as text) into a "
+                       "coding-agent session and submit it; the agent starts working. Only after the user says to "
+                       "send it. session: a name the user said, to switch first.",
+                       {"text": {"type": "string", "description": "exact message the user dictated (omit for the draft)"},
+                        "session": {"type": "string", "description": "session name as the user said it"},
+                        "even_if_busy": {"type": "boolean"}}, []),
         FunctionSchema("session_status", "What the coding-agent session is doing right now: idle, working, blocked, "
                        "and the end of its screen.", {}, []),
         FunctionSchema("set_voice",

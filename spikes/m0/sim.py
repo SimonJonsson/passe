@@ -131,6 +131,17 @@ SCENARIOS = {
         ("say", "Send it to the session."),
         ("silence", 18.0),
     ],
+    "sendnamed": [  # replays the failed live session: a session named by voice, dictated text, "Confirm."
+        ("silence", 1.0),
+        ("say", "See if you can find the scalping conversation."),
+        ("silence", 12.0),
+        ("say", "Send testing, testing to it."),
+        ("silence", 14.0),
+        ("say", "Can you pass hello there to the daamn session?"),
+        ("silence", 10.0),
+        ("say", "Confirm."),
+        ("silence", 16.0),
+    ],
     "prompt": [
         ("silence", 1.0),
         ("say", "Hey, I want a prompt for Claude Code to add retry logic to the uploader."),
@@ -210,7 +221,8 @@ _sent_at: list = []
 
 
 def fake_send(pane, text):
-    (SIM / "sent.txt").write_text(f"pane {pane}\n\n{text}\n")
+    with (SIM / "sent.txt").open("a") as f:
+        f.write(f"--- pane {pane}\n{text}\n")
     _sent_at.append(_time.monotonic())
     return {"ok": True}
 

@@ -46,9 +46,13 @@ Rules:
   so. A short faithful draft beats a complete-looking invented one.
 - Use the user's own framing of the subject and the problem; include concrete details they gave (examples,
   symptoms, files, commands, names).
-- Sections, in this order, omitting empty ones: Goal, Context, Requirements, Out of scope, Done when,
-  Open questions. Markdown is fine. Concise: no filler, no restating the same point.
-- "Done when" must be checkable and proportionate: what a person or test would verify, nothing grander.
+- Write it as a conversational summary, the way you'd message a capable colleague: two to four short paragraphs
+  of plain prose covering what's going on (with the concrete details), what we want done, and how we'll know it's
+  done. No headings, no bold, no requirement lists; use backticks only for paths, commands and names. If there
+  are open questions, end with a short "Open questions:" line or two-to-four-item list. Concise: no filler, no
+  restating the same point.
+- How we'll know it's done must be checkable and proportionate: what a person or test would verify, nothing
+  grander.
 - If a coding-agent session brief is given, ground the prompt in it: where the session stands, its results and
   the next step the user chose. Facts from the brief count as stated.
 - If a Passe log path is given, start the draft with a "Read first" line telling the agent to read that file
