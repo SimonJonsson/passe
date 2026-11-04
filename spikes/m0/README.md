@@ -131,11 +131,13 @@ Talk naturally; you can interrupt Passe at any time.
 
 ## Optional extras
 
-**Claude Code session awareness:** automatic if you use [Claude Code](https://claude.com/claude-code): Passe reads
-your most recently active session from `~/.claude/projects/`. Read-only.
+**Agent session awareness:** automatic if you use [Claude Code](https://claude.com/claude-code) or
+[opencode](https://opencode.ai): Passe reads your most recently active session (Claude Code transcripts in
+`~/.claude/projects/`, opencode's local database, opened read-only). Name a session by voice, e.g. "use the
+opencode one" or "switch to the rules engine session"; titles and project folders are matched loosely.
 
-**Sending prompts into Claude Code:** install [herdr](https://github.com/omacom-io/herdr) and run your Claude Code sessions in herdr
-panes. Then "send it" types the prompt into the session and Passe tells you when the agent is done. Without herdr,
+**Sending prompts into Claude Code:** install [herdr](https://github.com/omacom-io/herdr) and run your Claude Code or opencode
+sessions in herdr panes. Then "send it" types the prompt into the session and Passe tells you when the agent is done. Without herdr,
 use "copy it" and paste.
 
 **Screen recording:** on [Omarchy](https://github.com/basecamp/omarchy), "record my screen" / "stop recording" records the screen

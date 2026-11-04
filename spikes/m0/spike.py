@@ -61,7 +61,7 @@ What you're for:
 - You're a capable assistant: when the user asks for something, do it. Don't turn requests into questions about
   what they're trying to solve. Ask only when you genuinely can't take the next step, one question about one
   thing, never a menu of options.
-- You can see the user's coding-agent session (Claude Code) through tools: session_brief (summary, key points,
+- You can see the user's coding-agent session (Claude Code or opencode) through tools: session_brief (summary, key points,
   results, next steps), ask_session (answers any question from its transcript), list_sessions and use_session
   (switch to another one). That's your context: lean on it instead of asking the user to explain.
 - If the user has already said what the prompt should do, work on exactly that: no session brief needed.
@@ -71,8 +71,9 @@ What you're for:
   Never describe what you're about to do instead of doing it. In the same reply call update_draft with that
   concrete next step as the note. Then refine together; the user steers. You draft prompts; the coding agent
   does the work, so say "we'll have it…", never "I'll fix…".
-- Sessions by name: "find the scalping conversation", "switch to the trading one" means use_session with that
-  name (not ask_session, which only searches inside the current session).
+- Sessions by name: "find the scalping conversation", "look up the opencode session", "switch to the trading
+  one" means use_session with that name (not ask_session, which only searches inside the current session).
+  Speech recognition may split "opencode" into "open code".
 - Sending: "send it" / "send it to Claude" means send_to_session, which types the draft into the session and
   submits it, so the agent starts working. A dictated message ("send 'testing testing' to scalp") goes in as
   text, the named session as session. If the user hasn't clearly said to send, ask "Send it to <session>?"
@@ -199,7 +200,13 @@ _LEAD = r"^\s*((ok(ay)?|hey|passe|pass)[\s,]+)*"
 PAUSE = re.compile(_LEAD + r"(pause|mute|go quiet|stop listening)([\s,]+(please|for a (sec(ond)?|moment|bit)))*[\s.!,]*$",
                    re.I)
 RESUME = re.compile(_LEAD + r"(un[\s-]?pause|resume|un[\s-]?mute|i'?m back|start listening|wake up)\b", re.I)
-END_SESSION = re.compile(r"\b(end|close|finish|stop)\b[\w\s]{0,10}\bsession\b", re.I)
+# Session commands only count when they're the whole utterance: "look up open code session" (opencode, misheard)
+# must not restart Passe, and "close the opencode session" must not end it.
+_CMD_LEAD = r"^\W*((ok(ay)?|hey|so|alright|right|passe|pass|please)\W+)*"
+START_SESSION = re.compile(_CMD_LEAD + r"((start|begin|open)\s+(a\s+)?(new\s+)?session|new\s+session)"
+                           r"(\s+please)?[\s.!,]*$", re.I)
+END_SESSION = re.compile(_CMD_LEAD + r"(end|close|finish|stop)\s+(the\s+|this\s+|our\s+)?session"
+                         r"(\s+(please|now))?[\s.!,]*$", re.I)
 _SOUND_TAG = re.compile(r"\s*<(laugh|chuckle|sigh|cough|sniffle|groan|yawn|gasp)>\s*", re.I)
 
 
@@ -522,7 +529,8 @@ def render(stats: Stats, args: argparse.Namespace):
         (f"   ● REC {time.monotonic() - stats.recording_since:,.0f}s · " if stats.recording_since else "   ",
          "bold red"),
         (f"session {stats.session_n}", "bold"),
-        (f" · agent: {stats.agent_session['title'][:40]}" if stats.agent_session else " · agent: none", "cyan"),
+        (f" · agent: {stats.agent_session['title'][:40]} ({stats.agent_session.get('kind', 'claude')})"
+         if stats.agent_session else " · agent: none", "cyan"),
         f" · {(time.monotonic() - stats.session_start) / 60:.0f} min · draft v{len(stats.draft_versions)}"
         + (f" · ignored {stats.ignored_while_idle} while idle" if stats.ignored_while_idle else "")
         + (f" · ignored {stats.ignored_while_paused} while paused" if stats.ignored_while_paused else ""),
@@ -1143,7 +1151,7 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
 
         found = await asyncio.to_thread(agent_sessions.list_sessions)
         stats.session_choices = found
-        rows = [{"number": i, "title": s["title"], "minutes_since_active": s["age_min"],
+        rows = [{"number": i, "title": s["title"], "agent": s.get("kind"), "minutes_since_active": s["age_min"],
                  "current": bool(stats.agent_session and s["id"] == stats.agent_session["id"])}
                 for i, s in enumerate(found, 1)]
         await done(params, call, {"sessions": rows}, f"{len(rows)} sessions")
@@ -1164,8 +1172,10 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
         ev("agent_session", id=pick["id"], title=pick["title"])
         await ensure_brief()
         await done(params, call, {"now_using": pick["title"], "summary": (stats.agent_brief or {}).get("summary"),
-                                  "note": "if the user wanted something sent there, call send_to_session now; "
-                                          "never say you're sending without calling it"},
+                                  "agent": pick.get("kind"),
+                                  "note": "say which session you switched to (its title, briefly) so the user can "
+                                          "catch a wrong match; if they wanted something sent there, call "
+                                          "send_to_session now; never say you're sending without calling it"},
                    f"using {pick['title']}")
 
     async def recording_active() -> bool:
@@ -1957,9 +1967,11 @@ async def main(args: argparse.Namespace) -> None:
         LLMFullResponseStartFrame,
         LLMTextFrame,
         MetricsFrame,
+        TranscriptionFrame,
         UserStartedSpeakingFrame,
         UserStoppedSpeakingFrame,
         VADUserStartedSpeakingFrame,
+        VADUserStoppedSpeakingFrame,
     )
     from pipecat.metrics.metrics import (
         LLMUsageMetricsData,
@@ -1967,6 +1979,7 @@ async def main(args: argparse.Namespace) -> None:
         TTSUsageMetricsData,
     )
     from pipecat.observers.base_observer import BaseObserver, FramePushed
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
     from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -2026,9 +2039,6 @@ async def main(args: argparse.Namespace) -> None:
 
     voice_lock = None
     if args.voice_lock:
-        from pipecat.frames.frames import TranscriptionFrame, VADUserStoppedSpeakingFrame
-        from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-
         vp = VoicePrint()
         enrolled = await enroll_voice(args, vp)
 
@@ -2068,12 +2078,7 @@ async def main(args: argparse.Namespace) -> None:
 
         voice_lock = VoiceLock()
 
-    from pipecat.frames.frames import TranscriptionFrame as _Transcription
-    from pipecat.frames.frames import VADUserStoppedSpeakingFrame as _VADStopped
-    from pipecat.processors.frame_processor import FrameDirection as _Dir
-    from pipecat.processors.frame_processor import FrameProcessor as _Proc
-
-    class LivePartials(_Proc):
+    class LivePartials(FrameProcessor):
         """Shows what you're saying while you say it: re-transcribes the current utterance every ~0.5 s."""
 
         def __init__(self):
@@ -2097,9 +2102,9 @@ async def main(args: argparse.Namespace) -> None:
                     self._pre.append(frame.audio)
             elif isinstance(frame, VADUserStartedSpeakingFrame):
                 self._active, self._buf = True, bytearray(b"".join(self._pre))
-            elif isinstance(frame, _VADStopped):
+            elif isinstance(frame, VADUserStoppedSpeakingFrame):
                 self._active = False
-            elif isinstance(frame, _Transcription) and direction == _Dir.DOWNSTREAM:
+            elif isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
                 stats.live_user_done = (stats.live_user_done + " " + frame.text.strip()).strip()
                 stats.live_user = ""
             await self.push_frame(frame, direction)
@@ -2174,13 +2179,11 @@ async def main(args: argparse.Namespace) -> None:
     context = LLMContext(messages=[{"role": "system", "content": prompt}], tools=tools)
     holder["context"] = context
 
-    import re as _re
-
     import random
 
     from pipecat.frames.frames import TTSSpeakFrame
 
-    start_phrase = _re.compile(r"\b(start|begin|new|open)\b[\w\s]{0,12}\bsession\b", _re.I)
+    start_phrase = START_SESSION  # whole-utterance commands only (see START_SESSION)
 
     def start_new_session():
         context.set_messages([{"role": "system", "content": prompt}])
@@ -2196,12 +2199,12 @@ async def main(args: argparse.Namespace) -> None:
         stats.sent_version = 0
         stats.tool_calls.clear()
 
-    class SessionGate(_Proc):
+    class SessionGate(FrameProcessor):
         """Between sessions only "start session" gets through; "new session" mid-session starts fresh."""
 
         async def process_frame(self, frame, direction):
             await super().process_frame(frame, direction)
-            if isinstance(frame, _Transcription) and direction == _Dir.DOWNSTREAM:
+            if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
                 wants_new = bool(start_phrase.search(frame.text))
                 if stats.paused:
                     if RESUME.match(frame.text):
@@ -2384,7 +2387,7 @@ async def main(args: argparse.Namespace) -> None:
             if isinstance(f, VADUserStartedSpeakingFrame):
                 ev("vad_start", bot_speaking=stats._bot_speaking, mic_volume=round(float(stats.mic_volume), 3),
                    dbfs=round(float(stats.mic_dbfs), 1), session_active=stats.session_active)
-            elif isinstance(f, _VADStopped):
+            elif isinstance(f, VADUserStoppedSpeakingFrame):
                 ev("vad_stop")
             elif isinstance(f, UserStartedSpeakingFrame):
                 ev("user_start")
@@ -2392,7 +2395,7 @@ async def main(args: argparse.Namespace) -> None:
                 ev("user_stop")
             elif isinstance(f, _Interrupt):
                 ev("interruption", bot_speaking=stats._bot_speaking)
-            elif isinstance(f, _Transcription):
+            elif isinstance(f, TranscriptionFrame):
                 ev("transcript", text=f.text)
             elif isinstance(f, LLMFullResponseStartFrame):
                 msgs = context.get_messages()
@@ -2426,8 +2429,8 @@ async def main(args: argparse.Namespace) -> None:
                     stats.mic_volume = mic_tracker.volume
                 return
             now = time.monotonic()
-            if data.direction == _Dir.DOWNSTREAM or not isinstance(
-                    f, (VADUserStartedSpeakingFrame, _VADStopped, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+            if data.direction == FrameDirection.DOWNSTREAM or not isinstance(
+                    f, (VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
                         _Interrupt, BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
                 self._log(f)  # broadcast frames travel both ways; log each once
             if isinstance(f, VADUserStartedSpeakingFrame) and stats._bot_speaking and stats._barge_t is None:

@@ -241,3 +241,14 @@ Send-to-session fixes from a live session: "Confirm." and "sent to…" are accep
 text; sessions named by voice are matched loosely ("scalping" finds "scalp") and `send_to_session(session=…)`
 switches first; refused sends no longer retry in a loop; "stop session" ends the session. Orpheus moved to port
 18100 (`PASSE_ORPHEUS_PORT` overrides) because another project held 8100.
+
+## opencode sessions (2026-11-04)
+
+`agent_sessions.py` reads opencode sessions too: herdr reports each opencode pane's `ses_…` id, and the session
+lives in opencode's SQLite store (`~/.local/share/opencode/opencode.db`). It is opened read-only and only the
+`session`, `message` and `part` tables are queried (the same file holds opencode's account tokens). Parts
+become the same plain transcript as Claude Code's: text by role, tool calls as one-liners. Briefs, by-the-way
+questions and herdr sends work the same for both kinds. Spoken session names now match on title words (weighted
+double) and the project folder name, ranked by how many spoken words match; saying "opencode" or "claude" filters
+by kind. Claude-only title de-duplication (for compacted conversations) no longer merges distinct opencode
+sessions that share a title.

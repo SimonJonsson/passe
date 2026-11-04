@@ -31,7 +31,7 @@ SELF = ("Passe is the voice assistant the user is talking to: a spike in ~/Repos
         "behaves (its voice, turn-taking, prompts…), the subject of the prompt is Passe, not 'the coding agent'.")
 
 DRAFT_SYSTEM = f"""You write the prompt that the user is talking through with Passe, for a coding agent (Claude Code,
-Codex…) to execute. You get the conversation so far and the current draft; return the updated draft.
+opencode, Codex…) to execute. You get the conversation so far and the current draft; return the updated draft.
 
 {SELF}
 

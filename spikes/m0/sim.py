@@ -142,6 +142,13 @@ SCENARIOS = {
         ("say", "Confirm."),
         ("silence", 16.0),
     ],
+    "lookup": [  # finding an opencode session by voice, then a by-the-way question about it
+        ("silence", 1.0),
+        ("say", "Look up opencode session."),
+        ("silence", 14.0),
+        ("say", "What did it do?"),
+        ("silence", 14.0),
+    ],
     "prompt": [
         ("silence", 1.0),
         ("say", "Hey, I want a prompt for Claude Code to add retry logic to the uploader."),
