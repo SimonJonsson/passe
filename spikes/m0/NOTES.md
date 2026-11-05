@@ -252,3 +252,27 @@ questions and herdr sends work the same for both kinds. Spoken session names now
 double) and the project folder name, ranked by how many spoken words match; saying "opencode" or "claude" filters
 by kind. Claude-only title de-duplication (for compacted conversations) no longer merges distinct opencode
 sessions that share a title.
+
+## macOS / Apple Silicon (2026-11-03)
+
+Setup on an M3 (macOS 15): `pyrnnoise` is Linux-only (no macOS 15 wheel), so `--denoise` falls back to `none`;
+Python is pinned to 3.12; `mlx-whisper` is installed on Apple Silicon (Pipecat's Whisper module requires it there).
+
+Turn-taking was much worse than on the GPU box. The event log showed why: end of turn ~1.8 s, nearly all of it
+speech recognition (faster-whisper `small.en` on the CPU, ~1.6 s for a 6.7 s utterance). Live partials made it
+worse: they used the same model, and a final transcript that started while a partial ran took twice as long (3.3 s).
+
+`--stt-engine auto` now picks **MLX on the Apple GPU** with `large-v3-turbo` (0.72 s for the same utterance), and
+live partials run `base.en` on the CPU (0.36 s), so they no longer slow the final transcript (0.73 s alongside one;
+partials on the GPU doubled it to ~1.5 s). Scripted `sim.py prompt` runs on the M3:
+
+| STT | STT first output (median) | End of turn | Turn (median) |
+|---|---|---|---|
+| MLX `large-v3-turbo` (default) | 926 ms | 0.93 s | 1.42 s |
+| MLX `small.en` | 385 ms | 0.75 s | 1.26 s |
+
+End of turn can't go below VAD stop (0.2 s) + `--turn-grace` (0.5 s): `small.en` hits that floor, turbo is ~0.2 s
+over it. Turbo stays the default for accuracy; `--stt-model mlx-community/whisper-small.en-mlx` trades it for speed.
+
+herdr on macOS reports no `agent_session` for panes, so `agent_sessions.py` also maps a pane to its transcript by
+working directory (and terminal title when several panes share one).

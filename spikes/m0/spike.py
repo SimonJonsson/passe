@@ -231,6 +231,13 @@ YES_WORDS = re.compile(r"^\W*(yes|yep|yeah|sure|go ahead|do it|go for it|please|
                        re.I)  # only counts as an answer to "send it?"
 FORCE_CONSENT = re.compile(r"\b(as is|anyway|just copy|copy it (now|regardless)|that'?s fine|leave it)\b", re.I)
 
+
+def asked_to_copy(said: str, passe_said: str) -> bool:
+    """The user asked to copy, or said yes right after Passe asked whether to copy."""
+    offered = re.search(r"\b(cop(y|ying)|clipboard)\b[^.?!]*\?", passe_said or "", re.I)
+    return bool(COPY_REQUEST.search(said or "") or (YES_WORDS.search(said or "") and offered))
+
+
 STOP_COMMAND = re.compile(
     r"^\s*(ok(ay)?[\s,]+)?(stop|wait|hold on|hang on|shush|quiet|shut up|enough)"
     r"([\s,]+(please|a (sec(ond)?|moment)|for a (sec(ond)?|moment)|there|it))*[\s.!,]*$", re.I)
@@ -370,7 +377,9 @@ def parse_args() -> argparse.Namespace:
                    help="where speech models run (auto: the GPU if there's an NVIDIA card, else the CPU)")
     p.add_argument("--tts-device", choices=["cuda", "cpu"], default=None, help="where Kokoro runs (default: --device)")
     p.add_argument("--stt-model", default=None,
-                   help="Whisper model (default: large-v3-turbo on GPU, small.en on CPU)")
+                   help="Whisper model (default: large-v3-turbo on a GPU or Apple Silicon, small.en on CPU)")
+    p.add_argument("--stt-engine", choices=["auto", "faster-whisper", "mlx"], default="auto",
+                   help="speech recognition engine (auto: MLX on the Apple Silicon GPU, faster-whisper elsewhere)")
     p.add_argument("--vad-stop", type=float, default=0.2, help="VAD stop_secs (smart-turn decides the rest)")
     p.add_argument("--turn-max-wait", type=float, default=1.6,
                    help="longest silence before your turn ends when smart-turn thinks you're mid-sentence")
@@ -380,7 +389,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vad-confidence", type=float, default=0.7, help="VAD speech confidence threshold 0–1")
     p.add_argument("--mic-test", action="store_true", help="show live mic level + VAD confidence, no chat")
     p.add_argument("--seconds", type=float, default=0, help="with --mic-test: run N seconds, print per-second lines")
-    p.add_argument("--denoise", choices=["rnnoise", "none"], default="rnnoise",
+    p.add_argument("--denoise", choices=["rnnoise", "none"], default=None,
                    help="noise suppression for voice detection (speech recognition gets raw audio, see --stt-audio)")
     p.add_argument("--stt-audio", choices=["raw", "denoised"], default="raw",
                    help="what speech recognition hears; denoising hurts accuracy (5090 card → 50-90 part)")
@@ -405,10 +414,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--audition", action="store_true", help="play each Kokoro female voice through your headphones")
     p.add_argument("--no-dashboard", action="store_true", help="plain Pipecat logs instead of the dashboard")
     args = p.parse_args()
+    import importlib.util
+
+    have_rnnoise = importlib.util.find_spec("pyrnnoise") is not None  # Linux-only dependency (no macOS 15 wheel)
+    if args.denoise == "rnnoise" and not have_rnnoise:
+        raise SystemExit("--denoise rnnoise needs pyrnnoise, which isn't installed on this platform. "
+                         "Use --denoise none.")
+    if args.denoise is None:
+        args.denoise = "rnnoise" if have_rnnoise else "none"
+        if not have_rnnoise:
+            print("Noise suppression is off (pyrnnoise isn't available on this platform).")
     if args.device == "auto":
         args.device = "cuda" if has_nvidia_gpu() else "cpu"
     args.tts_device = args.tts_device or args.device
-    args.stt_model = args.stt_model or ("deepdml/faster-whisper-large-v3-turbo-ct2" if args.device == "cuda"
+    import platform
+
+    apple_silicon = platform.system() == "Darwin" and platform.machine() == "arm64"
+    if args.stt_engine == "auto":
+        args.stt_engine = "mlx" if apple_silicon and importlib.util.find_spec("mlx_whisper") else "faster-whisper"
+    if args.stt_engine == "mlx" and not apple_silicon:
+        raise SystemExit("--stt-engine mlx needs an Apple Silicon Mac.")
+    # On a Mac, MLX runs Whisper on the GPU: large-v3-turbo there is ~2x faster than small.en on the CPU.
+    args.stt_model = args.stt_model or ("mlx-community/whisper-large-v3-turbo" if args.stt_engine == "mlx"
+                                        else "deepdml/faster-whisper-large-v3-turbo-ct2" if args.device == "cuda"
                                         else "small.en")
     saved = load_prefs().get("tts")
     args.tts = args.tts or (saved if saved and not (saved == "orpheus" and args.device == "cpu") else None) or (
@@ -1043,7 +1071,7 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
                last_user=stats.last_user_text)
             await done(params, call, {"error": "already handled this turn. Stop calling tools and reply."}, "loop cut")
             return
-        if not COPY_REQUEST.search(stats.last_user_text or ""):
+        if not asked_to_copy(stats.last_user_text, stats.last_assistant_text):
             ev("guard_blocked", tool="copy_to_clipboard", reason="the user didn't ask to copy",
                last_user=stats.last_user_text)
             await done(params, call, {"copied": False, "note": "the user didn't ask to copy. Don't call "
@@ -1409,7 +1437,8 @@ def setup_tools(llm, stats: Stats, args: argparse.Namespace, holder: dict):
             return
         for fc in function_calls:
             if fc.function_name == "copy_to_clipboard" and ((fc.arguments or {}).get("force")
-                                                            or not COPY_REQUEST.search(stats.last_user_text or "")):
+                                                            or not asked_to_copy(stats.last_user_text,
+                                                                                 stats.last_assistant_text)):
                 continue
             if fc.function_name in lead_ins:
                 await service.push_frame(TTSSpeakFrame(lead_ins[fc.function_name]))
@@ -2007,8 +2036,9 @@ async def main(args: argparse.Namespace) -> None:
             import atexit
 
             atexit.register(orpheus_tts.stop_server, stats.server_proc)
-    print(f"Loading models on {args.device.upper()} (Whisper {args.stt_model}, {args.tts} voice, Silero, "
-          "smart-turn)…", flush=True)
+    where = "the Apple GPU (MLX)" if args.stt_engine == "mlx" else args.device.upper()
+    print(f"Loading models (Whisper {args.stt_model} on {where}, {args.tts} voice, Silero, smart-turn)…",
+          flush=True)
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
@@ -2019,14 +2049,27 @@ async def main(args: argparse.Namespace) -> None:
             audio_in_filter=make_input_filter(args, denoise=(args.stt_audio == "denoised")),
         )
     )
-    stt = WhisperSTTService(
-        device=args.device,
-        compute_type="float16" if args.device == "cuda" else "int8",
-        settings=WhisperSTTService.Settings(model=args.stt_model, language=Language.EN),
-    )
+    if args.stt_engine == "mlx":
+        import mlx_whisper
+        from faster_whisper import WhisperModel
+        from pipecat.services.whisper.stt import WhisperSTTServiceMLX
+
+        stt = WhisperSTTServiceMLX(settings=WhisperSTTServiceMLX.Settings(model=args.stt_model,
+                                                                          language=Language.EN))
+        # The first call downloads and loads the model; do it now, not on your first sentence.
+        mlx_whisper.transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo=args.stt_model, language="en")
+        # Live partials run a small model on the CPU: sharing the GPU with them doubled the final transcript's time.
+        partial_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+    else:
+        stt = WhisperSTTService(
+            device=args.device,
+            compute_type="float16" if args.device == "cuda" else "int8",
+            settings=WhisperSTTService.Settings(model=args.stt_model, language=Language.EN),
+        )
+        partial_model = stt._model
     # The first inference is slow (kernel loading / allocation); do it now, not on your first sentence.
-    if stt._model is not None:
-        segs, _ = stt._model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+    if partial_model is not None:
+        segs, _ = partial_model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
         list(segs)
 
     extra = {} if args.reasoning == "none" else {"reasoning_effort": args.reasoning}
@@ -2114,8 +2157,8 @@ async def main(args: argparse.Namespace) -> None:
                 x = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
 
                 def run():
-                    segs, _ = stt._model.transcribe(x, language="en", beam_size=1, without_timestamps=True,
-                                                    condition_on_previous_text=False)
+                    segs, _ = partial_model.transcribe(x, language="en", beam_size=1, without_timestamps=True,
+                                                       condition_on_previous_text=False)
                     return " ".join(seg.text.strip() for seg in segs)
 
                 text = await asyncio.to_thread(run)
@@ -2126,7 +2169,8 @@ async def main(args: argparse.Namespace) -> None:
             finally:
                 self._busy = False
 
-    partial_every = 0.5 if args.device == "cuda" else 1.5  # spare the CPU
+    # GPU / Mac: partials are cheap (or on their own small CPU model); plain CPU: spare it for the final transcript.
+    partial_every = 0.5 if args.device == "cuda" else 0.6 if args.stt_engine == "mlx" else 1.5
     live_partials = LivePartials()
 
     vad_denoise = None
