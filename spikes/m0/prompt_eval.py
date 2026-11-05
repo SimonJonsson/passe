@@ -75,6 +75,8 @@ def tool_accuracy(s: dict) -> dict:
         if e["kind"] != "user_turn" or not e.get("text"):
             continue
         said = e["text"]
+        passe_before = next((spike.conversational(x.get("full") or "") for x in reversed(evs[:i])
+                             if x["kind"] == "assistant_turn" and (x.get("full") or "").strip()), "")
         nxt = next((j for j in range(i + 1, len(evs)) if evs[j]["kind"] == "user_turn" and evs[j].get("text")),
                    len(evs))
         called = [x for x in evs[i + 1:nxt] if x["kind"] == "tool_call"]
@@ -108,7 +110,7 @@ def tool_accuracy(s: dict) -> dict:
             errors.append(f"said it was sending without sending (after: {said!r})")
         if spike.CONTROL_UTTERANCE.search(said) and "update_draft" in names - blocked:
             errors.append(f"drafted from an instruction to Passe: {said!r}")
-        if "copy_to_clipboard" in names - blocked and not spike.COPY_REQUEST.search(said):
+        if "copy_to_clipboard" in names - blocked and not spike.asked_to_copy(said, passe_before):
             errors.append(f"copied without being asked (after: {said!r})")
     expected = hits + len(misses)
     penalty = 2 * len(errors) + 0.5 * len(caught)  # caught = the talker erred but a guard prevented harm

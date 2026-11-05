@@ -12,7 +12,7 @@ into a Claude Code session. Speech recognition and the voice run on your own mac
 
 | | |
 |---|---|
-| **OS** | Linux (built and tested on Arch / Omarchy, Wayland). macOS should work in CPU mode but is untested. Windows: untested. |
+| **OS** | Linux (built and tested on Arch / Omarchy, Wayland). macOS on Apple Silicon works (set up on an M3, macOS 15): speech recognition runs on its GPU via MLX, the voice on the CPU; mic noise suppression (RNNoise) is Linux-only, so it's off there. Windows: untested. |
 | **Hardware** | A microphone and **headphones** (there's no echo cancellation, so speakers make Passe hear itself). Any modern CPU works. An NVIDIA GPU is optional and gives a more expressive voice (Orpheus). |
 | **Software** | [uv](https://docs.astral.sh/uv/) (it fetches Python 3.12+ for you), PortAudio, and a clipboard tool (`wl-copy`, `xclip`, `xsel` or `pbcopy`) |
 | **Disk** | ~6 GB for the Python environment and models, plus ~15 GB more if you set up the GPU voice |
@@ -88,9 +88,9 @@ It picks the best mode for your machine automatically:
 
 | | CPU (no NVIDIA GPU) | NVIDIA GPU |
 |---|---|---|
-| Speech recognition | Whisper `small.en` | Whisper `large-v3-turbo` |
+| Speech recognition | Whisper `small.en` (Apple Silicon: `large-v3-turbo` on the GPU via MLX) | Whisper `large-v3-turbo` |
 | Voice | **Pocket TTS**: natural female voices, made for CPUs | **Orpheus**: very expressive, can laugh and sigh (needs the extra setup below) |
-| Typical reply delay | ~1.5–3 s on a fast CPU, more on older ones | ~1–1.7 s |
+| Typical reply delay | ~1.5–3 s on a fast CPU, more on older ones; ~1.4 s on an M3 | ~1–1.7 s |
 
 The first start downloads models (a few minutes). A dashboard opens with the conversation, the prompt draft,
 tool activity and latency. **Ctrl+C quits.**

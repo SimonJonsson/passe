@@ -67,21 +67,42 @@ def _title_from_transcript(path: Path) -> str | None:
     return title if isinstance(title, str) else None
 
 
+def _transcript_for_pane(pane: dict, title: str, panes: list[dict]) -> Path | None:
+    """Find a pane's transcript when herdr doesn't report its session id. Claude Code keeps transcripts in
+    ~/.claude/projects/<cwd with / and . turned into ->/. A transcript whose title matches the pane's terminal
+    title wins; if no title matches and this is the only Claude pane in that directory, take the newest."""
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    candidates = sorted((PROJECTS / re.sub(r"[/.]", "-", cwd)).glob("*.jsonl"),
+                        key=lambda f: f.stat().st_mtime, reverse=True)[:15]
+    if not candidates:
+        return None
+    want = title.lower()
+    for path in candidates:
+        if want and (_title_from_transcript(path) or "").strip().lower() == want:
+            return path
+    alone = sum(1 for q in panes if q.get("cwd") == cwd) == 1
+    return candidates[0] if alone else None
+
+
 def list_sessions(limit: int = 8, max_age_hours: float = 48) -> list[dict]:
     """Most recently active first. Herdr panes give live titles; other recent transcripts fill in."""
     found: dict[str, dict] = {}
     con = _opencode()
-    for p in _herdr_panes():
+    panes = _herdr_panes()
+    claude_panes = [p for p in panes if p.get("agent") == "claude"]
+    for p in panes:
         sess = p.get("agent_session") or {}
-        if sess.get("kind") != "id":
-            continue
         if p.get("agent") == "claude":
-            path = next(PROJECTS.glob(f"*/{sess['value']}.jsonl"), None)
-            if path:
-                found[sess["value"]] = {"id": sess["value"], "kind": "claude", "path": path, "cwd": p.get("cwd"),
-                                        "title": _SPINNER.sub("", p.get("terminal_title_stripped") or "").strip(),
-                                        "pane": p.get("pane_id"), "status": p.get("agent_status")}
-        elif p.get("agent") == "opencode" and con is not None:
+            path = next(PROJECTS.glob(f"*/{sess['value']}.jsonl"), None) if sess.get("kind") == "id" else None
+            title = _SPINNER.sub("", p.get("terminal_title_stripped") or "").strip()
+            if path is None:
+                path = _transcript_for_pane(p, title, claude_panes)  # herdr on macOS doesn't report agent_session
+            if path and path.stem not in found:
+                found[path.stem] = {"id": path.stem, "kind": "claude", "path": path, "cwd": p.get("cwd"),
+                                    "title": title, "pane": p.get("pane_id"), "status": p.get("agent_status")}
+        elif p.get("agent") == "opencode" and con is not None and sess.get("kind") == "id":
             oc = _opencode_session(con, sess["value"])
             if oc:
                 oc.update(pane=p.get("pane_id"), status=p.get("agent_status"), cwd=p.get("cwd") or oc["cwd"])
